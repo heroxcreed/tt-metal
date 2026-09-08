@@ -55,6 +55,8 @@ sfpi_inline sfpi::vFloat unsigned_remainder_recip(const sfpi::vInt& b_signed) {
 // Returns: unsigned remainder r
 sfpi_inline sfpi::vInt compute_unsigned_remainder_int32(
     const sfpi::vInt& a_signed, const sfpi::vInt& b_signed, const sfpi::vFloat& inv_b_f) {
+    sfpi::lreg_pressure _;
+
     // Absolute value of a; handle edge case where sign-magnitude conversion yields negative
     sfpi::vMag a = sfpi::abs(a_signed);
     sfpi::vFloat a_f = sfpi::convert<sfpi::vFloat>(a, sfpi::RoundMode::Nearest);

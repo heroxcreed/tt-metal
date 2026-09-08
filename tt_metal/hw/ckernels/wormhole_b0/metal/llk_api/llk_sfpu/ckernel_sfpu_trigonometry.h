@@ -477,6 +477,8 @@ inline void calculate_atan() {
 
 template <bool APPROXIMATION_MODE>
 sfpi_inline sfpi::vFloat sfpu_asin_poly_bf16(sfpi::vFloat val) {
+    sfpi::lreg_pressure _;
+
     // asin(z) = z*P(z^2) for |z| <= 5/8.
     sfpi::vFloat z2 = val * val;
     // Single-precision fit to asin(sqrt(u))/sqrt(u). Regenerate with:
