@@ -1641,7 +1641,8 @@ class ttMLA:
 
         A sparse full-indexer layer also writes its index-key chunk to the caller-owned ``index_kv_cache``;
         a shared/reuse-indexer layer deliberately skips that write because it owns no indexer state. The
-        enclosing block skips FFN/MoE/norm/LM head as well, so this path produces no first-token output.
+        enclosing block skips FFN/MoE as well, so this path produces no hidden state (the populated KV cache
+        is the output).
         """
         signpost(header="MLA_START")
         seq_len_local = hidden_states.shape[2]
