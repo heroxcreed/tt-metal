@@ -82,6 +82,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -107,6 +108,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -128,6 +130,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -149,6 +152,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -174,6 +178,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 - name: "(Kimi-K2.7-1T) prefill transformer determinism 5k"
@@ -198,6 +203,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 - name: "(Kimi-K2.7-1T) chunked prefill padded accuracy 15k@5k no-trace"
@@ -226,6 +232,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -257,6 +264,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -294,6 +302,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -334,6 +343,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -367,6 +377,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -391,6 +402,7 @@
       release_ready: false
   owner_id: U09L76N1MAT  # Nenad Babin
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -425,6 +437,7 @@
       release_ready: false
   owner_id: U09L76N1MAT  # Nenad Babin
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -448,6 +461,7 @@
       release_ready: false
   owner_id: U0ACLAM77PS  # Kosta Grujcic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 - name: "(Kimi-K3-2.8T) MLA chunked accuracy 10k@5k + determinism 5k@5k"
@@ -470,6 +484,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -493,6 +508,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -517,6 +533,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -538,6 +555,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -567,6 +585,7 @@
       release_ready: false
   owner_id: U09LK84G4TF  # Nikola Milicevic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -589,6 +608,7 @@
       release_ready: false
   owner_id: U09LK84G4TF  # Nikola Milicevic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -618,6 +638,7 @@
       release_ready: false
   owner_id: U09LK84G4TF  # Nikola Milicevic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -643,6 +664,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -668,6 +690,7 @@
       release_ready: false
   owner_id: U07N3CUUN05  # Iva Potkonjak
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -691,6 +714,7 @@
       release_ready: false
   owner_id: U08SXRPCTJ5  # Janko Mitrovic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -712,6 +736,7 @@
       release_ready: false
   owner_id: U08SXRPCTJ5  # Janko Mitrovic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -749,6 +774,7 @@
       release_ready: false
   owner_id: U08ECJQ848G # Viacheslav Melnykov
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -795,6 +821,7 @@
       release_ready: false
   owner_id: U08ECJQ848G # Viacheslav Melnykov
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -1029,6 +1056,7 @@
       release_ready: true
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
+  budget_type: demo
   sp_config: sc4
 
 
@@ -1060,6 +1088,7 @@
       release_ready: true
   owner_id: U0AC4LTJH1P # Jaksa Jovicic
   team: shield
+  budget_type: demo
   sp_config: sc4
 
 
@@ -1136,6 +1165,7 @@
       release_ready: false
   owner_id: U08RL15T4N8 # Danilo Djekic
   team: models
+  budget_type: demo
   sp_config: sc1
 
 
@@ -1167,4 +1197,5 @@
       release_ready: false
   owner_id: U085GDCAZTN # Pavle Josipovic
   team: ttnn
+  budget_type: demo
   sp_config: sc1
