@@ -119,63 +119,6 @@ def find_trace_dir(input_source: str, isl_total: int, padding_side: str) -> tupl
     return None
 
 
-def check_first_token_match_host_ref(
-    ref_snapshots: list | None,
-    number_of_non_padded_tokens: int,
-    padding_side: str,
-    first_token_id: int,
-    tokenizer,
-) -> bool | None:
-    """Check TT's first token vs HF reference argmax at the expected first token position.
-
-    Returns:
-        True if match, False if mismatch, None if no reference available.
-    """
-    if not ref_snapshots:
-        return None
-    hf_logits_full = ref_snapshots[-1]  # [1, seq_len, vocab]
-    last_real_idx = number_of_non_padded_tokens - 1 if padding_side == "right" else hf_logits_full.shape[-2] - 1
-    hf_token_id = int(hf_logits_full[0, last_real_idx, :].argmax().item())
-    hf_token_text = tokenizer.decode([hf_token_id]) if tokenizer else "N/A"
-    match = hf_token_id == first_token_id
-    logger.info(
-        f"HF reference token at position {last_real_idx}: "
-        f"ID={hf_token_id} [{repr(hf_token_text)}] | TT==HF match: {match}"
-    )
-    return match
-
-
-def check_first_token_match(trace, trace_dir: Path, first_token_id: int, first_token_prob: float) -> bool | None:
-    """Check whether the produced first token matches the trace reference.
-
-    Looks up the expected token ID from trace metadata or output_metadata.json.
-
-    Returns:
-        True if match, False if mismatch, None if no reference available.
-    """
-    ref_token_id = trace.metadata.get("next_token_id")
-    ref_token_text = trace.metadata.get("next_token_text")
-
-    if ref_token_id is None or ref_token_text is None:
-        output_meta_path = (trace_dir / "output_metadata.json").resolve()
-        if output_meta_path.exists():
-            with open(output_meta_path) as f:  # noqa: S108
-                output_meta = json.load(f)
-            ref_token_id = ref_token_id or output_meta.get("next_token_id")
-            ref_token_text = ref_token_text or output_meta.get("next_token_text")
-
-    if ref_token_text is None:
-        ref_token_text = "N/A"
-
-    token_match = first_token_id == ref_token_id if ref_token_id is not None else None
-    logger.info(
-        f"Trace first token: TT={first_token_id} (prob={first_token_prob:.4f}), "
-        f"Trace={ref_token_id} [{repr(ref_token_text)}], "
-        f"Match={'YES' if token_match else 'NO' if token_match is not None else 'N/A'}"
-    )
-    return token_match
-
-
 # Subset name -> JSONL filename on HuggingFace
 INFINITEBENCH_SUBSETS = {
     "passkey": "passkey.jsonl",
@@ -451,7 +394,6 @@ def extract_tt_state_dict(variant, hf_model):
 
     result = {
         "embed_weight": sd["embed_tokens.weight"].float(),
-        "norm_weight": sd["norm.weight"],
         "layers": [],
     }
 
@@ -469,7 +411,6 @@ def tt_state_dict_to_hf_state_dict(tt_sd):
     """
     hf_sd = {}
     hf_sd["embed_tokens.weight"] = tt_sd["embed_weight"]
-    hf_sd["norm.weight"] = tt_sd["norm_weight"]
 
     for i, layer in enumerate(tt_sd["layers"]):
         prefix = f"layers.{i}."
@@ -655,13 +596,13 @@ def load_and_compute_layer_by_layer(
 
     Returns:
         LayerByLayerResult(state_dict=None, ref_snapshots, ref_kvpe_list)
-        Note: state_dict is always None (cache built to disk instead)
+        Note: state_dict is always None (cache built to disk instead).
+        ref_snapshots layout: [embed, layer_0, ..., layer_{num_layers-1}]. There are no final-norm /
+        LM-head entries: the TT prefill transformer has no tail, so there is nothing to compare them to.
     """
     from models.demos.deepseek_v3.utils.config_helpers import sub_state_dict
     from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
     from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_gate_prefill import GateComputeMode
-    from models.demos.deepseek_v3_d_p.tt.tt_distributed_rms_norm import TtDistributedRmsNorm
-    from models.demos.deepseek_v3_d_p.tt.tt_lm_head import TtLMHead
     from models.demos.deepseek_v3_d_p.tt.tt_parallel_embedding import TtParallelEmbedding
     from models.demos.deepseek_v3_d_p.tt.tt_prefill_block import TtPrefillBlock
     from models.demos.deepseek_v3_d_p.utils.test_utils import convert_state_dict, detect_language_model_prefix
@@ -892,64 +833,8 @@ def load_and_compute_layer_by_layer(
         _log_memory(f"After layer {i} cleared")
         logger.debug(f"Layer {i} processed, cache cleared")
 
-    # --- Process Norm ---
-    logger.info("Processing norm...")
-    norm_sd = sub_state_dict(lazy_sd, f"{prefix}model.norm.")
-    norm_dequant = convert_state_dict(norm_sd, config)
-
-    if compute_reference:
-        norm_with_prefix = {f"norm.{k}": v for k, v in norm_dequant.items()}
-        hf_model.load_state_dict(norm_with_prefix, strict=False)
-        logger.debug(f"[norm] h_ref {h_ref.dtype=}, norm_weight dtype={norm_dequant['weight'].dtype}")
-        with torch.no_grad():
-            h_ref = hf_model.norm(h_ref)
-        ref_snapshots.append(h_ref)
-        del norm_with_prefix
-
-    if build_ttnn_cache:
-        # Build norm cache
-        TtDistributedRmsNorm.build_ttnn_cache(
-            torch_weight=norm_dequant["weight"],
-            emb_dim=config.hidden_size,
-            mesh_device=mesh_device,
-            cache_path=weight_cache_path,
-            cache_name_prefix="norm",
-        )
-
-    for k in norm_sd.keys():
-        lazy_sd.evict(k)
-    del norm_sd, norm_dequant
-    gc.collect()
-
-    # --- Process LM Head ---
-    logger.info("Processing lm_head...")
-    lm_head_sd = sub_state_dict(lazy_sd, f"{prefix}lm_head.")
-    lm_head_dequant = convert_state_dict(lm_head_sd, config)
-
-    if compute_reference:
-        # Apply lm_head projection: logits = h_ref @ lm_head_weight.T
-        logger.debug(f"[lm_head] h_ref {h_ref.dtype=}, lm_head_weight.dtype={lm_head_dequant['weight'].dtype}")
-        lm_head_weight = lm_head_dequant["weight"].to(torch.bfloat16)
-        with torch.no_grad():
-            h_ref_lm = torch.nn.functional.linear(h_ref.to(torch.bfloat16), lm_head_weight)
-        ref_snapshots.append(h_ref_lm)
-        del lm_head_weight
-
-    if build_ttnn_cache:
-        TtLMHead.build_ttnn_cache(
-            torch_weight=lm_head_dequant["weight"],
-            vocab_size=config.vocab_size,
-            emb_dim=config.hidden_size,
-            mesh_device=mesh_device,
-            cache_path=weight_cache_path,
-            is_column_parallel=True,
-        )
-
-    for k in lm_head_sd.keys():
-        lazy_sd.evict(k)
-    del lm_head_sd, lm_head_dequant
-    gc.collect()
-    _log_memory("After lm_head processed and cleared")
+    # No final norm / LM head: the TT prefill transformer has no tail (the populated KV cache is its
+    # output), so neither their weight cache nor a reference logits snapshot is built.
 
     # Cleanup
     lazy_sd.close()
@@ -970,6 +855,10 @@ class ReferenceCacheKey:
 
     Changing any field produces a different cache filename, so stale results
     are never reused silently.
+
+    The snapshot LAYOUT is not part of the key: a cache file written before the prefill tail
+    (final norm + LM head) was removed carries two extra trailing snapshots, and the consumer zips
+    labels against snapshots, so those entries are simply ignored and the file stays reusable.
     """
 
     weight_type: str  # "pretrained" or "random"
@@ -1198,7 +1087,6 @@ class DebugTraceData:
     token_ids: torch.Tensor  # [1, seq_len] int64
     ref_snapshots: dict[str, torch.Tensor]  # label -> [1, seq, hidden_dim] bfloat16
     ref_kvpe_list: list[torch.Tensor]  # per-layer [1, 1, seq, kv_lora_rank + qk_rope_head_dim]
-    logits: torch.Tensor | None  # [seq, vocab_size] float32
     metadata: dict  # raw metadata.json contents
 
 
@@ -1233,7 +1121,8 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         num_layers: Number of layers to load (default: all layers from metadata)
 
     Returns:
-        DebugTraceData with token_ids, per-layer reference snapshots, KVPE cache, and logits
+        DebugTraceData with token_ids, per-layer reference snapshots, and KVPE cache. A trace's
+        `logits.safetensors` / `next_token_id` are not read: the TT prefill transformer has no LM head.
     """
     from safetensors import safe_open
 
@@ -1327,18 +1216,10 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         kv_format = "post-transform" if use_post_transform else "pre-transform (legacy)"
         logger.info(f"Loaded {len(ref_kvpe_list)} KVPE layers from kv_cache.safetensors ({kv_format})")
 
-    logits = None
-    logits_path = trace_dir / "logits.safetensors"
-    if logits_path.exists():
-        with safe_open(logits_path, framework="pt") as f:
-            logits = f.get_tensor("logits")
-        logger.info(f"Loaded logits: shape={list(logits.shape)}, dtype={logits.dtype}")
-
     return DebugTraceData(
         token_ids=token_ids,
         ref_snapshots=ref_snapshots,
         ref_kvpe_list=ref_kvpe_list,
-        logits=logits,
         metadata=metadata,
     )
 
@@ -1352,10 +1233,9 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
     RoPE), so they are identical whether the full sequence or only its first ``isl_total``
     tokens are prefilled.
 
-    The stored ``logits`` / ``next_token_id`` are the FULL sequence's final-position
-    products and are meaningless for the shorter prefill, so ``logits`` is dropped
-    (set to ``None``); callers must skip the logits / first-token checks for a sliced
-    trace (``metadata`` is left untouched, so ``next_token_id`` must not be trusted).
+    ``metadata`` is left untouched, so its ``next_token_id`` (the FULL sequence's final-position
+    product) does not describe the sliced prefix; nothing reads it, the prefill transformer has no
+    LM head.
 
     Args:
         trace: Trace to slice (typically longer than the requested isl).
@@ -1371,7 +1251,6 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
         token_ids=trace.token_ids[:, :isl_total],
         ref_snapshots={label: snap[:, :isl_total, :] for label, snap in trace.ref_snapshots.items()},
         ref_kvpe_list=[kv[:, :, :isl_total, :] for kv in trace.ref_kvpe_list],
-        logits=None,  # full-sequence final-position logits are invalid after slicing
         metadata=trace.metadata,
     )
 
