@@ -58,10 +58,9 @@ class TtPrefillRuntimeConfig:
     # adapter — no default, so the runtime never bakes in a specific model.
     model_cfg: Optional[type] = None
     # When True, the last transformer layer runs kv-only: it fills the KV cache
-    # (which migration needs) and skips its Q/SDPA/output projection and FFN/MoE.
-    # `prefill()` returns None either way (the KV cache is the output; the transformer
-    # has no norm / LM-head / sampling tail), so this only trims dead work on the final
-    # stage. The pipeline sets it on the last rank.
+    # (which migration needs) and skips its Q/SDPA/output projection, FFN/MoE,
+    # the final RMSNorm, and the LM head. `prefill()` then returns None. The pipeline
+    # sets this on the last rank so the final stage is headless.
     kv_only_last_layer: bool = False
     # Build the DFlash drafter context-KV cache during this prefill (opt-in). Every rank builds its owned fc
     # slices from $DFLASH_HF_MODEL; only the last rank builds the KV tail + cache.
@@ -107,7 +106,7 @@ class TtPrefillRuntime:
     whole model (the config defaults). For pipeline-parallel prefill, a driver builds
     one runtime per rank with first_layer_idx / is_first_rank / is_last_rank set, and
     the non-boundary ranks consume/produce hidden-state activations instead of token
-    IDs.
+    IDs / sampled tokens.
     """
 
     def __init__(
@@ -544,7 +543,7 @@ class TtPrefillRuntime:
         """The captured/warmed metadata forward: per-chunk scalars come from the persistent metadata
         tensor on-device (actual_start/actual_end = None host-side). Writes user slot metadata[0].
         Returns the forward output — a hidden-state activation on a non-last rank (forwarded downstream
-        over D2D), or None on the last/single rank (no intermediates requested; the KV cache is the output)."""
+        over D2D), or the last/single rank's ignored KV-only tuple."""
         return self.model.forward(
             self._trace_input,
             kv_cache.kvpe,  # unwrap the engine-owned container to the primary MLA cache (mirrors prefill_chunk)
@@ -614,9 +613,9 @@ class TtPrefillRuntime:
         Alternatively, if a host-side per-layer callback is registered (set_layer_ack_channel /
         set_layer_completion_sink), the model fires that once per layer instead.
 
-        Always returns None on the last rank: no token is sampled, the transformer has no norm / LM-head /
-        sampling tail (decode owns the LM head). When `kv_only_last_layer` is set on the config the last
-        layer's compute is additionally stripped down to the KV cache fill, which migration consumes.
+        Always returns None: no token is sampled. (When `kv_only_last_layer` is set on the config the
+        last layer's compute is stripped down to the KV cache fill, which migration consumes, and the
+        final RMSNorm / LM head / sample are skipped entirely.)
 
         Args:
             input_tensor: on the first rank, one chunk's tokens as an SP-sharded uint32 ROW_MAJOR DRAM
@@ -756,8 +755,8 @@ class TtPrefillRuntime:
             return self._pack_activation(out, self.drafter.export_partial())
 
         # Non-last rank: forward returns the hidden-state activation to forward downstream.
-        # Last/single rank: forward returns the optional intermediates (None here, none were
-        # requested), which this KV-output path ignores.
+        # Last/single rank: forward returns the (token, prob, intermediates) tuple, which this
+        # KV-output path ignores.
         return out if not self.config.is_last_rank else None
 
     def release_trace(self) -> None:
