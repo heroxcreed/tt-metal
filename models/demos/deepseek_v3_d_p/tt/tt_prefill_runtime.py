@@ -67,7 +67,7 @@ class TtPrefillRuntimeConfig:
     dflash_enabled: bool = False
     # Pipeline-parallel rank slicing. first_layer_idx is the global index of this
     # rank's first layer; is_first_rank gates the embedding, is_last_rank marks the
-    # final stage (non-last ranks forward the hidden state to the next rank).
+    # final stage (non-last ranks forward the hidden state instead of running a tail).
     # Defaults make a single-rank runtime own the whole model.
     first_layer_idx: int = 0
     is_first_rank: bool = True
