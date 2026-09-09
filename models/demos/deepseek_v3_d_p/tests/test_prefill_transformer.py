@@ -626,29 +626,11 @@ def run_model(
         # The device has no norm / LM-head tail, so the token is derived on the CPU from the last
         # layer's hidden state and compared with the reference's first token. Full model only: a
         # truncated model's argmax means nothing. The row is pass/fail (1.0 / 0.0), not a PCC.
-        trace_n_layers = trace.metadata.get("n_layers") if trace is not None else None
-        if not use_pretrained:
-            first_token_skip = "random weights"
-        elif num_layers != config.num_hidden_layers:
-            first_token_skip = f"num_layers={num_layers} != num_hidden_layers={config.num_hidden_layers}"
-        elif trace is not None and trace_sliced:
-            first_token_skip = "sliced trace (its logits belong to the full sequence)"
-        elif trace is not None and num_layers != trace_n_layers:
-            first_token_skip = f"num_layers={num_layers} != trace n_layers={trace_n_layers}"
-        elif trace is not None and trace.logits is None:
-            first_token_skip = "trace has no logits.safetensors"
-        elif trace is None and ref_snapshots is None:
-            first_token_skip = "no host reference"
-        else:
-            first_token_skip = None
-
-        if first_token_skip is not None:
-            logger.info(f"Skipping first-token check: {first_token_skip}")
-        else:
+        trace_full_model = trace is not None and not trace_sliced and num_layers == trace.metadata.get("n_layers")
+        host_full_model = trace is None and ref_snapshots is not None and num_layers == config.num_hidden_layers
+        if use_pretrained and ((trace_full_model and trace.logits is not None) or host_full_model):
             tail_weights = load_host_tail_weights(model_path, config)
-            if tail_weights is None:
-                logger.warning("Skipping first-token check: tail weights not in checkpoint")
-            else:
+            if tail_weights is not None:
                 norm_weight, lm_head_weight = tail_weights
                 tail_args = (
                     number_of_non_padded_tokens,
@@ -674,6 +656,15 @@ def run_model(
                 pcc_results.append(("first_token_match", 1.0 if match else 0.0))
                 del norm_weight, lm_head_weight, tail_weights, tt_logits
                 gc.collect()
+        elif trace is not None and not trace_full_model:
+            reason = (
+                "trace sliced to a shorter isl (full-sequence logits/next-token invalid)"
+                if trace_sliced
+                else f"num_layers={num_layers} != trace n_layers={trace.metadata.get('n_layers')}"
+            )
+            logger.info(f"Skipping trace first-token check: {reason}")
+        else:
+            logger.debug("Skipping first token check")
 
         profiler.end("pcc_validation")
 
