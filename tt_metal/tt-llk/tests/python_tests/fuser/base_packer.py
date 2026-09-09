@@ -4,15 +4,16 @@
 
 from typing import TYPE_CHECKING, List
 
-import torch
-
 if TYPE_CHECKING:
     from .l1_operation import L1Operation
     from .fuser_config import GlobalConfig
     from .block_data import BlockData
     from .pack_node import PackNode
 
+from helpers.llk_params import PackerReluType
+
 from .golden import Golden
+from .golden_state import tile_operation
 from .indexing import InvocationGranularity
 
 
@@ -30,8 +31,9 @@ class Packer(Golden):
         1. Subclass Packer
         2. Override get_headers() with the required LLK header files
         3. Override init(), pack(), uninit() to emit the C++ LLK calls
-        4. Override golden() to compute the expected pack result,
-           calling self.relu_golden() and self.l1_acc_golden() as needed
+        4. Override golden() to compute the expected pack result, calling
+           self.relu_golden() as needed (L1 accumulation is handled by the
+           L1AccumOutputTiles output collector)
     """
 
     # Controls the tile iteration pattern for the pack loop.
@@ -43,15 +45,11 @@ class Packer(Golden):
 
     pack_mode: str = "PackMode::Default"
 
-    per_call_golden: bool = False
+    # Set True on packers that untilize dest to row-major L1: the output golden is
+    # one untilize over the whole tensor (UntilizePackOutput), not per tile.
+    untilizes_l1_output: bool = False
 
-    def supports_per_call(self, node) -> bool:
-        return self.per_call_golden and (
-            self.granularity == InvocationGranularity.TILE
-            or getattr(node, "custom", False)
-        )
-
-    def golden_call(
+    def golden(
         self,
         call,
         dest,
@@ -60,14 +58,11 @@ class Packer(Golden):
         operation: "L1Operation",
         config: "GlobalConfig",
     ) -> None:
-        from .golden_state import tile_operation
-
-        output.write(
-            call.out,
-            self.golden(
-                dest.get(call.dest), pack_node, tile_operation(operation), config
-            ),
-        )
+        tile = dest.get(call.dest)
+        if pack_node.pack_relu != PackerReluType.NoRelu:
+            tile = self.relu_golden(tile, config, tile_operation(operation), pack_node)
+        # L1 accumulation is handled by the output collector (L1AccumOutputTiles).
+        output.write(call.out, tile)
 
     requires_dest_remap: bool = False
 
@@ -79,21 +74,6 @@ class Packer(Golden):
         pack(), and uninit().
         """
         return []
-
-    def golden(
-        self,
-        tensor: torch.Tensor,
-        pack_node: "PackNode",
-        operation: "L1Operation",
-        config: "GlobalConfig",
-    ) -> torch.Tensor:
-        """Compute the golden pack result in Python.
-
-        Returns the tensor after applying pack transforms.
-        Override and call self.relu_golden() or self.l1_acc_golden()
-        as needed based on the pack_node config.
-        """
-        return tensor
 
     def init(
         self,

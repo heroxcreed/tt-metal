@@ -12,6 +12,11 @@ from .unpack_a import UnpackerA
 
 class TransposeDestUnpacker(UnpackerA):
 
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        # Dummy unpacker: transpose_dest operates in place on existing dest, so
+        # there is no source tile to push.
+        return
+
     def init(
         self,
         operation: L1Operation,

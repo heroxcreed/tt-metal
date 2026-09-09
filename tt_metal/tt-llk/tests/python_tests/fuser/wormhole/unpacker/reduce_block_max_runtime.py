@@ -2,9 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
+from typing import List
 
-import torch
 from fuser.base_unpacker import Unpacker
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
@@ -17,18 +16,13 @@ class ReduceBlockMaxRuntimeUnpacker(Unpacker):
     granularity = InvocationGranularity.ROW
     per_block_init = True
 
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        self.reduce_block_max_row_unpack_golden(
+            call, inputs, srcs, compute_unit, operation, config
+        )
+
     def get_headers(self) -> List[str]:
         return ["experimental/llk_unpack_AB_reduce_custom_runtime.h"]
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: L1Operation,
-        config: GlobalConfig,
-        compute_unit: FpuNode = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return tensor_a, tensor_b
 
     def perf_set_valid(
         self,

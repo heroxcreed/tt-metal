@@ -22,7 +22,7 @@ class TransposeDestFpu(Fpu):
             "llk_math_transpose_dest.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

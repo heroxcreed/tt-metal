@@ -2,9 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import TYPE_CHECKING, List, Tuple
-
-import torch
+from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
     from .l1_operation import L1Operation
@@ -47,15 +45,11 @@ class Unpacker(Golden):
     granularity = InvocationGranularity.NONE
     per_block_init: bool = False
 
-    per_call_golden: bool = False
+    # Set True on unpackers that tilize row-major L1 into src: their output is
+    # compared as tile-concatenated data (TilizedOutputTiles), not row-major.
+    produces_tilized_l1: bool = False
 
-    def supports_per_call(self, node) -> bool:
-        return self.per_call_golden and (
-            self.granularity == InvocationGranularity.TILE
-            or getattr(node, "custom", False)
-        )
-
-    def golden_call(
+    def golden(
         self,
         call,
         inputs,
@@ -153,22 +147,3 @@ class Unpacker(Golden):
         unpack(), and uninit().
         """
         return []
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: "L1Operation",
-        config: "GlobalConfig",
-        compute_unit: "FpuNode" = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the golden unpack transformation in Python.
-
-        Returns (tensor_a, tensor_b) after applying the unpack transforms
-        (transpose, broadcast, tilize, etc.). Set an output tensor to None
-        to indicate that operand is unused by downstream math.
-
-        Called by FpuNode.golden() before the math golden. The returned tensors
-        become the math unit's inputs.
-        """
-        return tensor_a, tensor_b

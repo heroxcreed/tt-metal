@@ -16,6 +16,11 @@ from .reduce_block_max import ReduceBlockMaxFpu
 class ReduceBlockMaxRuntimeFpu(ReduceBlockMaxFpu):
     granularity = InvocationGranularity.ROW
 
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.reduce_block_max_row_math_golden(
+            call, srcs, dest, compute_unit, operation, config
+        )
+
     def get_headers(self) -> List[str]:
         return [
             "experimental/llk_math_reduce_custom.h",

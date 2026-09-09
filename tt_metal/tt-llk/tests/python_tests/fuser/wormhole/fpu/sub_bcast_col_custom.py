@@ -18,6 +18,11 @@ class SubBcastColCustomFpu(EltwiseFpu):
     granularity = InvocationGranularity.ROW
     per_block_init = True
 
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.sub_bcast_col_math_golden(
+            call, srcs, dest, compute_unit, operation, config
+        )
+
     def __init__(self):
         super().__init__(MathOperation.Elwsub)
 

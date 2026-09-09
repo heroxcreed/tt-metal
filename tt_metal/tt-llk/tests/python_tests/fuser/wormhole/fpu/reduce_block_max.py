@@ -20,6 +20,11 @@ class ReduceBlockMaxFpu(Fpu):
 
     per_block_init = True
 
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.reduce_block_max_row_math_golden(
+            call, srcs, dest, compute_unit, operation, config
+        )
+
     def init(
         self,
         operation: L1Operation,
@@ -54,7 +59,7 @@ class ReduceBlockMaxFpu(Fpu):
         dest_acc = config.dest_acc.cpp_enum_value
         return f"_llk_math_reduce_block_max_row_uninit_<{dest_acc}>();\n"
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

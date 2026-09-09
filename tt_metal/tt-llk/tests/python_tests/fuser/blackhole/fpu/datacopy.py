@@ -19,15 +19,13 @@ from helpers.llk_params import (
 class DatacopyFpu(Fpu):
     granularity = InvocationGranularity.TILE
 
-    per_call_golden = True
-
     def get_headers(self) -> List[str]:
         return [
             "llk_math_common.h",
             "llk_math_eltwise_unary_datacopy.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

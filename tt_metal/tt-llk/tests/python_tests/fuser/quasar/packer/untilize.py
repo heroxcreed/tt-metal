@@ -4,20 +4,23 @@
 
 from typing import List
 
-import torch
 from fuser.block_data import BlockData
 from fuser.fuser_config import GlobalConfig
 from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
 from fuser.operand import BfdResource, bfd_current
 from fuser.pack_node import PackNode
-from helpers.llk_params import PackerReluType
 
 from .packer import Packer
 
 
 class PackUntilize(Packer):
     granularity = InvocationGranularity.ROW
+    untilizes_l1_output = True
+
+    def golden(self, call, dest, output, pack_node, operation, config) -> None:
+        self.untilize_pack_call_golden(call, dest, output, pack_node, operation, config)
+
     per_block_init = True
 
     def get_headers(self) -> List[str]:
@@ -25,18 +28,6 @@ class PackUntilize(Packer):
             "llk_pack.h",
             "llk_pack_untilize.h",
         ]
-
-    def golden(
-        self,
-        tensor: torch.Tensor,
-        pack_node: PackNode,
-        operation: L1Operation,
-        config: GlobalConfig,
-    ) -> torch.Tensor:
-        if pack_node.pack_relu != PackerReluType.NoRelu:
-            tensor = self.relu_golden(tensor, config, operation, pack_node)
-
-        return self.untilize_golden(tensor, config, operation, pack_node)
 
     def init(
         self,

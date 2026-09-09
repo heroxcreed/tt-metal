@@ -2,9 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
+from typing import List
 
-import torch
 from fuser.base_unpacker import Unpacker
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
@@ -18,6 +17,12 @@ from helpers.llk_params import DestAccumulation
 class UnpackerTilizeA(Unpacker):
     granularity = InvocationGranularity.ROW
     per_block_init = True
+    produces_tilized_l1 = True
+
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        self.tilize_unpack_call_golden(
+            call, inputs, srcs, compute_unit, operation, config
+        )
 
     def perf_set_valid(
         self,
@@ -44,19 +49,6 @@ class UnpackerTilizeA(Unpacker):
             "llk_unpack_common.h",
             "llk_unpack_tilize.h",
         ]
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: L1Operation,
-        config: GlobalConfig,
-        compute_unit: FpuNode,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self.tilize_golden(tensor_a, config, operation, compute_unit),
-            None,
-        )
 
     def init(
         self,

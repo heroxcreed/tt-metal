@@ -2,32 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
+from typing import List
 
-import torch
 from fuser.base_unpacker import Unpacker
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
 from fuser.fuser_config import GlobalConfig
 from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
-from helpers.llk_params import (
-    BroadcastType,
-    UnpackToDest,
-)
+from helpers.llk_params import BroadcastType
 
 
 class UnpackerAB(Unpacker):
     granularity = InvocationGranularity.TILE
 
-    per_call_golden = True
-
-    def supports_per_call(self, node) -> bool:
-        return super().supports_per_call(node) and (
-            node.unpack_to_dest == UnpackToDest.No
-        )
-
-    def golden_call(
+    def golden(
         self,
         call,
         inputs,
@@ -51,19 +40,6 @@ class UnpackerAB(Unpacker):
             "llk_unpack_AB.h",
             "llk_unpack_common.h",
         ]
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: L1Operation,
-        config: GlobalConfig,
-        compute_unit: FpuNode,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        tensor_b = self.broadcast_golden(tensor_b, config, operation, compute_unit)
-        tensor_a = self.transpose_golden(tensor_a, config, operation, compute_unit)
-
-        return tensor_a.flatten(), tensor_b.flatten()
 
     def perf_set_valid(
         self,

@@ -20,9 +20,10 @@ from fuser.quasar.unpacker.unpack_a import (
 class DatacopyFpu(Fpu):
     granularity = InvocationGranularity.ROW
 
-    per_call_golden = True
-
     per_block_init = True
+
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.row_math_call_golden(call, srcs, dest, compute_unit, operation, config)
 
     def get_headers(self) -> List[str]:
         return [
@@ -30,7 +31,7 @@ class DatacopyFpu(Fpu):
             "llk_math_eltwise_unary_datacopy.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

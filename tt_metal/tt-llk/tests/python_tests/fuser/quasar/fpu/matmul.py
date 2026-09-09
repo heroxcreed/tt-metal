@@ -17,13 +17,16 @@ class MatmulFpu(Fpu):
     granularity = InvocationGranularity.BLOCK
     per_block_init = True
 
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.matmul_math_call_golden(call, srcs, dest, compute_unit, operation, config)
+
     def get_headers(self) -> List[str]:
         return [
             "llk_math_common.h",
             "llk_math_matmul.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

@@ -48,7 +48,7 @@ class BinarySfpu(Sfpu):
             "sfpu_operations.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor: torch.Tensor,
         operation: L1Operation,

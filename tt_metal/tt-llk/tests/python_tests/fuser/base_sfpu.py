@@ -44,15 +44,7 @@ class Sfpu(Golden):
 
     input_count = 1
 
-    per_call_golden: bool = False
-
-    def supports_per_call(self, node) -> bool:
-        return self.per_call_golden and (
-            self.granularity == InvocationGranularity.TILE
-            or getattr(node, "custom", False)
-        )
-
-    def golden_call(
+    def golden(
         self,
         call,
         dest,
@@ -60,7 +52,46 @@ class Sfpu(Golden):
         operation: "L1Operation",
         config: "GlobalConfig",
     ) -> None:
-        raise NotImplementedError
+        """Apply the SFPU op in place across the whole dest bank (one block).
+
+        SFPU is block-granular: one call transforms every tile the block holds.
+        The dest bank stores untilized tiles; they are tilized, run through
+        _batch_golden per block, and written back untilized.
+        """
+        from helpers.tilize_untilize import tilize_block, untilize_block
+
+        tile_shape = operation.tile_shape
+        tile_dims = (tile_shape.total_row_dim(), tile_shape.total_col_dim())
+        num_faces = tile_shape.total_num_faces()
+        fmt = config.sentinel.golden_math_format
+
+        tile_count = len(dest)
+        tilized = [
+            tilize_block(
+                dest.get(i), tile_dims, fmt, num_faces, tile_dimensions=tile_dims
+            ).flatten()
+            for i in range(tile_count)
+        ]
+        block_tensor = torch.cat(tilized)
+        block_dims = (tile_count * tile_dims[0], tile_dims[1])
+
+        result = self._batch_golden(
+            block_tensor, operation, config, compute_unit, block_dims, tile_count
+        )
+
+        tile_size = tilized[0].numel()
+        result = result.reshape(tile_count, tile_size)
+        for i in range(tile_count):
+            dest.set(
+                i,
+                untilize_block(
+                    result[i].flatten(),
+                    fmt,
+                    tile_dims,
+                    tile_dimensions=tile_dims,
+                    num_faces=num_faces,
+                ).reshape(tile_dims),
+            )
 
     def init(
         self,
@@ -104,7 +135,7 @@ class Sfpu(Golden):
         """
         return ""
 
-    def golden(
+    def _batch_golden(
         self,
         tensor: torch.Tensor,
         operation: "L1Operation",
@@ -113,12 +144,10 @@ class Sfpu(Golden):
         batch_dims: tuple,
         batch_tile_cnt: int,
     ) -> torch.Tensor:
-        """Compute the golden SFPU result in Python.
+        """Compute the golden SFPU result for one block of tilized dest data.
 
-        Operates on tilized dest data per block. batch_dims and batch_tile_cnt
-        describe the current block's tile layout. Returns the transformed tensor.
-
-        Called by SfpuNode.golden() on each block of the tilized dest tensor.
+        batch_dims and batch_tile_cnt describe the block's tile layout. Called per
+        block by golden() above; override with the op's SFPU math.
         """
         return tensor
 

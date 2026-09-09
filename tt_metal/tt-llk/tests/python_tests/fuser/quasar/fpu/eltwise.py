@@ -20,8 +20,6 @@ from helpers.llk_params import (
 class EltwiseFpu(Fpu):
     granularity = InvocationGranularity.TILE
 
-    per_call_golden = True
-
     def __init__(self, operation: MathOperation):
         if not operation in MathOperation.get_fpu_binary_operations():
             raise ValueError(
@@ -36,7 +34,7 @@ class EltwiseFpu(Fpu):
             "llk_math_eltwise_binary_broadcast.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

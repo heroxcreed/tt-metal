@@ -18,6 +18,9 @@ class MatmulPacker(Packer):
     granularity = InvocationGranularity.BLOCK
     per_block_init = True
 
+    def golden(self, call, dest, output, pack_node, operation, config) -> None:
+        self.matmul_pack_call_golden(call, dest, output, pack_node, operation, config)
+
     def get_headers(self) -> List[str]:
         return [
             "llk_pack.h",

@@ -17,6 +17,9 @@ from helpers.llk_params import DataFormat, ReduceDimension, ReducePool
 class ReduceFpu(Fpu):
     granularity = InvocationGranularity.TILE
 
+    def golden(self, call, srcs, dest, compute_unit, operation, config) -> None:
+        self.reduce_call_golden(call, srcs, dest, compute_unit, operation, config)
+
     def __init__(self, reduce_dim: ReduceDimension, reduce_pool: ReducePool):
         self.reduce_dim = reduce_dim
         self.reduce_pool = reduce_pool
@@ -27,7 +30,7 @@ class ReduceFpu(Fpu):
             "llk_math_reduce.h",
         ]
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,

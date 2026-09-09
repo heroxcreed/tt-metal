@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
+from typing import List
 
 import torch
 from fuser.base_unpacker import Unpacker
@@ -17,6 +17,25 @@ from fuser.operand import BfdResource, L1AccessMode, bfd_current
 class UnpackReduceTilize(Unpacker):
     granularity = InvocationGranularity.TILE
 
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        src = compute_unit.src_a
+        rows = src.tile_shape.total_row_dim()
+        cols = src.tile_shape.total_col_dim()
+        height, width = src.dimensions
+        dtype = inputs.view_a.tile(0).dtype
+        whole = torch.zeros(height, width, dtype=dtype)
+        for i in range(src.tile_count):
+            ty, tx = divmod(i, src.tile_count_x)
+            whole[ty * rows : (ty + 1) * rows, tx * cols : (tx + 1) * cols] = (
+                inputs.view_a.tile(i)
+            )
+        scrambled = self.tilize_golden(whole, config, operation, compute_unit).reshape(
+            height, width
+        )
+        ty, tx = divmod(call.in0, src.tile_count_x)
+        tile = scrambled[ty * rows : (ty + 1) * rows, tx * cols : (tx + 1) * cols]
+        srcs.push(tile, inputs.tile_b(call.in1))
+
     def __init__(self, reduce_dim, reduce_pool):
         self.reduce_dim = reduce_dim
         self.reduce_pool = reduce_pool
@@ -26,19 +45,6 @@ class UnpackReduceTilize(Unpacker):
             "llk_unpack_common.h",
             "llk_unpack_reduce_col_tilizeA_strided.h",
         ]
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: L1Operation,
-        config: GlobalConfig,
-        compute_unit: FpuNode,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self.tilize_golden(tensor_a, config, operation, compute_unit),
-            tensor_b,
-        )
 
     def perf_set_valid(
         self,

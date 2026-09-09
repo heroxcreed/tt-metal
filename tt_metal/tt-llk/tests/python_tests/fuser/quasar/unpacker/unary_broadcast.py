@@ -2,9 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple
+from typing import List
 
-import torch
 from fuser.base_unpacker import Unpacker
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
@@ -17,6 +16,13 @@ from helpers.llk_params import BroadcastType
 
 class UnaryBroadcastUnpacker(Unpacker):
     granularity = InvocationGranularity.TILE
+
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        tile = inputs.tile_a(call.in0)
+        broadcast = self.broadcast_tile_golden(
+            tile, operation, compute_unit, compute_unit.src_a
+        )
+        srcs.push(tile, broadcast)
 
     def _srcb_dvalids_per_tile(self, compute_unit: FpuNode) -> int:
         if compute_unit.broadcast_type == BroadcastType.Scalar:
@@ -48,19 +54,6 @@ class UnaryBroadcastUnpacker(Unpacker):
             "llk_unpack_common.h",
             "llk_unpack_unary_broadcast_operands.h",
         ]
-
-    def golden(
-        self,
-        tensor_a: torch.Tensor,
-        tensor_b: torch.Tensor,
-        operation: L1Operation,
-        config: GlobalConfig,
-        compute_unit: FpuNode,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        tensor_b = self.broadcast_golden(
-            tensor_a, config, operation, compute_unit, operand=compute_unit.src_a
-        )
-        return tensor_a.flatten(), tensor_b.flatten()
 
     def init(
         self,

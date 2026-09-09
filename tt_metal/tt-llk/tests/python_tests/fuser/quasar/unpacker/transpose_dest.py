@@ -14,6 +14,9 @@ from .unpack_a import UnpackerA
 class TransposeDestUnpacker(UnpackerA):
     granularity = InvocationGranularity.TILE
 
+    def golden(self, call, inputs, srcs, compute_unit, operation, config) -> None:
+        return
+
     def perf_set_valid(
         self,
         operation: L1Operation,

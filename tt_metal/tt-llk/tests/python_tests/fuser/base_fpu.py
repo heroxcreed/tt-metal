@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from .block_data import BlockData
 
 
-from .golden import Golden
+from .golden import Golden, _ensure_srcs
+from .golden_state import tile_operation
 from .indexing import InvocationGranularity
 
 
@@ -46,15 +47,7 @@ class Fpu(Golden):
     granularity = InvocationGranularity.NONE
     per_block_init: bool = False
 
-    per_call_golden: bool = False
-
-    def supports_per_call(self, node) -> bool:
-        return self.per_call_golden and (
-            self.granularity == InvocationGranularity.TILE
-            or getattr(node, "custom", False)
-        )
-
-    def golden_call(
+    def golden(
         self,
         call,
         srcs,
@@ -63,16 +56,11 @@ class Fpu(Golden):
         operation: "L1Operation",
         config: "GlobalConfig",
     ) -> None:
-        from .golden_state import tile_operation
-
         tensor_a, tensor_b = srcs.pop()
         single = tile_operation(operation)
         dimensions = single.max_output_dimensions
-        if tensor_a is None:
-            tensor_a = torch.zeros(dimensions)
-        if tensor_b is None:
-            tensor_b = torch.zeros(dimensions)
-        _, _, result = self.golden(
+        tensor_a, tensor_b = _ensure_srcs(tensor_a, tensor_b, dimensions)
+        _, _, result = self._batch_golden(
             tensor_a,
             tensor_b,
             dest.get(call.dest),
@@ -129,7 +117,7 @@ class Fpu(Golden):
         """
         return ""
 
-    def golden(
+    def _batch_golden(
         self,
         tensor_a: torch.Tensor,
         tensor_b: torch.Tensor,
@@ -138,14 +126,11 @@ class Fpu(Golden):
         config: "GlobalConfig",
         compute_unit: "FpuNode",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute the golden math result in Python.
+        """Compute the golden math for a single tile.
 
         Returns (tensor_a, tensor_b, tensor_dst) where tensor_dst is the expected
-        output after the math operation. tensor_a and tensor_b are passed through
-        (possibly modified) for downstream stages.
-
-        Called by FpuNode.golden() after the unpack golden. The input tensors
-        are the outputs of the unpacker's golden().
+        output after the math operation. Called per tile by the default golden()
+        wrapper above; override with the op's math (eltwise, datacopy, ...).
         """
         return (tensor_a, tensor_b, tensor_dst)
 
