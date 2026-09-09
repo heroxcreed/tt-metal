@@ -963,6 +963,112 @@ def slice_non_padded(tensor: torch.Tensor, num_real_tokens: int, padding_side: s
         return tensor.narrow(seq_dim, start, num_real_tokens)
 
 
+# --- Host-side tail: first token from the last layer's hidden state ---
+#
+# The TT prefill transformer has no norm / LM-head / sampling tail (decode owns the LM head), so the
+# test derives the first token on the HOST from the last layer's hidden state, which the PCC run already
+# brings back as `intermediates["layer_{N-1}"]`. The tail math on the CPU is trusted, so the token is a
+# check of everything BEFORE it. Only meaningful for the full model (num_layers == num_hidden_layers).
+
+
+def load_host_tail_weights(model_path, config) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Load the final RMSNorm gain and the LM-head weight from the checkpoint, dequantized to bf16.
+
+    Returns ``(norm_weight [emb], lm_head_weight [vocab, emb])``, or ``None`` when the checkpoint does
+    not carry them (a partial per-layer download). Same loading path as ``load_and_compute_layer_by_layer``.
+    """
+    from models.demos.deepseek_v3.utils.config_helpers import sub_state_dict
+    from models.demos.deepseek_v3.utils.lazy_state_dict import LazyStateDict
+    from models.demos.deepseek_v3_d_p.utils.test_utils import convert_state_dict, detect_language_model_prefix
+
+    lazy_sd = LazyStateDict(Path(model_path))
+    try:
+        prefix = detect_language_model_prefix(lazy_sd)
+        norm_key = f"{prefix}model.norm.weight"
+        lm_head_key = f"{prefix}lm_head.weight"
+        if norm_key not in lazy_sd or lm_head_key not in lazy_sd:
+            logger.warning(
+                f"Checkpoint at {model_path} has no {norm_key!r} / {lm_head_key!r} (partial download?); "
+                "host-side first-token check unavailable"
+            )
+            return None
+        norm_sd = sub_state_dict(lazy_sd, f"{prefix}model.norm.")
+        norm_weight = convert_state_dict(norm_sd, config)["weight"].to(torch.bfloat16)
+        lm_head_sd = sub_state_dict(lazy_sd, f"{prefix}lm_head.")
+        lm_head_weight = convert_state_dict(lm_head_sd, config)["weight"].to(torch.bfloat16)
+        for k in list(norm_sd.keys()) + list(lm_head_sd.keys()):
+            lazy_sd.evict(k)
+    finally:
+        lazy_sd.close()
+    assert (
+        lm_head_weight.shape[0] == config.vocab_size
+    ), f"lm_head weight rows {lm_head_weight.shape[0]} != config.vocab_size {config.vocab_size}"
+    logger.info(
+        f"Loaded host tail weights: norm {list(norm_weight.shape)}, lm_head {list(lm_head_weight.shape)} "
+        f"({lm_head_weight.numel() * 2 / 1024**3:.2f} GB bf16)"
+    )
+    return norm_weight, lm_head_weight
+
+
+def host_tail_logits(
+    hidden: torch.Tensor,
+    num_real_tokens: int,
+    padding_side: str,
+    norm_weight: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    eps: float,
+    vocab_chunk: int = 16384,
+) -> torch.Tensor:
+    """Final RMSNorm + LM head on the CPU for the LAST REAL token of ``hidden`` -> logits ``[vocab]`` fp32.
+
+    ``hidden`` is a full-sequence hidden state ``[1, seq, emb]`` (or ``[seq, emb]``); the last real
+    position follows the same convention as :func:`slice_non_padded`. RMSNorm mirrors the HF reference
+    (``DeepseekV3RMSNorm``: fp32 variance, cast back to the input dtype, then the gain). The projection
+    runs in fp32 in ``vocab_chunk``-row slabs so the bf16 LM-head weight is never copied whole to fp32.
+    """
+    h = hidden.reshape(-1, hidden.shape[-1])  # [seq, emb]
+    last_idx = num_real_tokens - 1 if padding_side == "right" else h.shape[0] - 1
+    x = h[last_idx : last_idx + 1]  # [1, emb], keeps the device dtype (bf16)
+    xf = x.to(torch.float32)
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    normed = (norm_weight.to(x.dtype) * xf.to(x.dtype)).to(torch.float32)  # [1, emb]
+    vocab = lm_head_weight.shape[0]
+    logits = torch.empty(vocab, dtype=torch.float32)
+    with torch.no_grad():
+        for start in range(0, vocab, vocab_chunk):
+            w = lm_head_weight[start : start + vocab_chunk].to(torch.float32)  # [chunk, emb]
+            logits[start : start + w.shape[0]] = (normed @ w.T).reshape(-1)
+    return logits
+
+
+def first_token_from_logits(
+    logits: torch.Tensor, tokenizer, top_k: int = 5
+) -> tuple[int, list[tuple[int, float, str]]]:
+    """argmax token id and the ``top_k`` ``(token_id, probability, text)`` candidates of one logits row."""
+    row = logits.reshape(-1).to(torch.float32)
+    probs = torch.softmax(row, dim=-1)
+    top_probs, top_ids = torch.topk(probs, min(top_k, row.numel()))
+    top = [
+        (int(i), float(p), tokenizer.decode([int(i)]) if tokenizer is not None else "N/A")
+        for i, p in zip(top_ids.tolist(), top_probs.tolist())
+    ]
+    return int(row.argmax().item()), top
+
+
+def log_and_compare_first_token(tt_token_id: int, ref_token_id: int, tokenizer, ref_source: str) -> bool:
+    """Log the host-derived TT first token next to the reference's and return whether they are equal."""
+
+    def _text(tid):
+        return repr(tokenizer.decode([tid])) if tokenizer is not None else "N/A"
+
+    match = tt_token_id == ref_token_id
+    logger.info(
+        f"First token: TT={tt_token_id} [{_text(tt_token_id)}] | ref({ref_source})={ref_token_id} "
+        f"[{_text(ref_token_id)}] | match={'YES' if match else 'NO'}"
+    )
+    return match
+
+
 # --- Tokenization helpers ---
 def tokenize_prompt_to_isl(
     tokenizer, max_isl: int, prompt_text: str = "Capital of France is", debug: bool = False
@@ -1087,6 +1193,7 @@ class DebugTraceData:
     token_ids: torch.Tensor  # [1, seq_len] int64
     ref_snapshots: dict[str, torch.Tensor]  # label -> [1, seq, hidden_dim] bfloat16
     ref_kvpe_list: list[torch.Tensor]  # per-layer [1, 1, seq, kv_lora_rank + qk_rope_head_dim]
+    logits: torch.Tensor | None  # [1, vocab] float32: the traced FULL model's final-position logits, or None
     metadata: dict  # raw metadata.json contents
 
 
@@ -1121,8 +1228,10 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         num_layers: Number of layers to load (default: all layers from metadata)
 
     Returns:
-        DebugTraceData with token_ids, per-layer reference snapshots, and KVPE cache. A trace's
-        `logits.safetensors` / `next_token_id` are not read: the TT prefill transformer has no LM head.
+        DebugTraceData with token_ids, per-layer reference snapshots, KVPE cache, and the golden's
+        final-position logits (`logits.safetensors`, key `logits`) when the trace has them. The logits
+        are only a reference for the full-model first-token check (see `host_tail_logits`); the
+        per-layer / KVPE PCC rows never use them. `next_token_id` is not read.
     """
     from safetensors import safe_open
 
@@ -1216,10 +1325,20 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         kv_format = "post-transform" if use_post_transform else "pre-transform (legacy)"
         logger.info(f"Loaded {len(ref_kvpe_list)} KVPE layers from kv_cache.safetensors ({kv_format})")
 
+    # Final-position logits of the traced full model, when the tracer saved them. Reference for the
+    # host-side first-token check only; meaningless for a sliced trace (see slice_debug_trace).
+    logits = None
+    logits_path = trace_dir / "logits.safetensors"
+    if logits_path.exists():
+        with safe_open(logits_path, framework="pt") as f:
+            logits = f.get_tensor("logits")
+        logger.info(f"Loaded golden logits: shape={list(logits.shape)}, dtype={logits.dtype}")
+
     return DebugTraceData(
         token_ids=token_ids,
         ref_snapshots=ref_snapshots,
         ref_kvpe_list=ref_kvpe_list,
+        logits=logits,
         metadata=metadata,
     )
 
@@ -1233,9 +1352,9 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
     RoPE), so they are identical whether the full sequence or only its first ``isl_total``
     tokens are prefilled.
 
-    ``metadata`` is left untouched, so its ``next_token_id`` (the FULL sequence's final-position
-    product) does not describe the sliced prefix; nothing reads it, the prefill transformer has no
-    LM head.
+    The stored ``logits`` are the FULL sequence's final-position product and do not describe the
+    sliced prefix, so they are dropped (``None``): the first-token check is skipped for a sliced
+    trace. ``metadata`` is left untouched; nothing reads its ``next_token_id``.
 
     Args:
         trace: Trace to slice (typically longer than the requested isl).
@@ -1251,6 +1370,7 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
         token_ids=trace.token_ids[:, :isl_total],
         ref_snapshots={label: snap[:, :isl_total, :] for label, snap in trace.ref_snapshots.items()},
         ref_kvpe_list=[kv[:, :, :isl_total, :] for kv in trace.ref_kvpe_list],
+        logits=None,  # full-sequence final-position logits are not a reference for the prefix
         metadata=trace.metadata,
     )
 

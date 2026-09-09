@@ -110,10 +110,12 @@ attention + absolute-position RoPE), so they are identical whether the full sequ
 just its first `isl_total` tokens are prefilled. The per-layer hidden-state PCC and the
 KVPE PCC checks therefore remain valid on the sliced reference.
 
-**Note:** the trace's stored `logits` / `next_token_id` belong to the *full* sequence's
-final position and are **not read** by the test at all: the prefill transformer has no
-norm / LM-head / sampling tail (the populated KV cache is its output), so the per-layer
-hidden-state PCC and the KVPE PCC are the only trace checks, sliced or not.
+**Note:** the trace's stored `logits` belong to the *full* sequence's final position. The
+prefill transformer has no norm / LM-head / sampling tail (the populated KV cache is its
+output), so they are used for exactly one thing: on a **full-model, unsliced** run the test
+derives the first token on the host (final norm + LM head on the CPU over the last layer's
+hidden state) and compares it with `argmax(logits)` as the `first_token_match` row. A sliced
+trace skips that row; `next_token_id` is never read.
 
 Requesting an `isl_total` **larger** than every available trace still yields no trace
 (the test then falls back to reference cache / live HF compute).
@@ -128,7 +130,7 @@ the loader reads by **fixed filenames/keys**, not by searching:
 - KV cache: `kv_cache/layer_{i}.safetensors` or flat `kv_cache.safetensors`, preferring
   the key `kv_post_transform_layer_{i}` and falling back to `compressed_kv_layer_{i}`
   (with a warning that PCC will be unreliable).
-- A `logits.safetensors`, if present, is ignored.
+- `logits.safetensors` (key `logits`, `[1, vocab]`), if present, feeds only the full-model first-token check.
 
 **What this means for you:**
 

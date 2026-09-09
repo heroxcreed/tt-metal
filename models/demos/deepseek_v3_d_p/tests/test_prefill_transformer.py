@@ -5,7 +5,10 @@
 """
 Test for TtPrefillTransformer — verifies composition of embed -> [block x N].
 
-Validates output shapes and PCC against torch reference.
+Validates output shapes and PCC against torch reference. For the full model the run also derives
+the first token on the HOST (final norm + LM head on the CPU over the last layer's hidden state) and
+compares it with the reference's first token; the device has no tail, so a wrong token points at
+something before it.
 
 Reference sources are checked in priority order:
 1. Debug trace on disk (pre-computed safetensors from a known-good run)
@@ -56,9 +59,13 @@ from models.demos.deepseek_v3_d_p.utils.transformer_helpers import (
     download_infinitebench_subset,
     extract_tt_state_dict,
     find_trace_dir,
+    first_token_from_logits,
+    host_tail_logits,
     load_and_compute_layer_by_layer,
     load_debug_trace,
+    load_host_tail_weights,
     load_reference_cache,
+    log_and_compare_first_token,
     mla_kvpe_width,
     save_reference_cache,
     slice_debug_trace,
@@ -302,6 +309,7 @@ def run_model(
     state_dict = None
     ref_snapshots = None
     ref_kvpe_list = None
+    model_path = None
 
     if use_pretrained:
         model_path = request.getfixturevalue("model_path")
@@ -613,6 +621,59 @@ def run_model(
                     logger.error(f"{label:<20s}  KVPE PCC comparison failed: {e}")
                     pcc_results.append((f"{label}_kv", -1.0))
                     pcc_results.append((f"{label}_pe", -1.0))
+
+        # --- First token (host-side tail) ---
+        # The device has no norm / LM-head tail, so the token is derived on the CPU from the last
+        # layer's hidden state and compared with the reference's first token. Full model only: a
+        # truncated model's argmax means nothing. The row is pass/fail (1.0 / 0.0), not a PCC.
+        trace_n_layers = trace.metadata.get("n_layers") if trace is not None else None
+        if not use_pretrained:
+            first_token_skip = "random weights"
+        elif num_layers != config.num_hidden_layers:
+            first_token_skip = f"num_layers={num_layers} != num_hidden_layers={config.num_hidden_layers}"
+        elif trace is not None and trace_sliced:
+            first_token_skip = "sliced trace (its logits belong to the full sequence)"
+        elif trace is not None and num_layers != trace_n_layers:
+            first_token_skip = f"num_layers={num_layers} != trace n_layers={trace_n_layers}"
+        elif trace is not None and trace.logits is None:
+            first_token_skip = "trace has no logits.safetensors"
+        elif trace is None and ref_snapshots is None:
+            first_token_skip = "no host reference"
+        else:
+            first_token_skip = None
+
+        if first_token_skip is not None:
+            logger.info(f"Skipping first-token check: {first_token_skip}")
+        else:
+            tail_weights = load_host_tail_weights(model_path, config)
+            if tail_weights is None:
+                logger.warning("Skipping first-token check: tail weights not in checkpoint")
+            else:
+                norm_weight, lm_head_weight = tail_weights
+                tail_args = (
+                    number_of_non_padded_tokens,
+                    padding_side,
+                    norm_weight,
+                    lm_head_weight,
+                    config.rms_norm_eps,
+                )
+                tt_logits = host_tail_logits(tt_intermediates[f"layer_{num_layers - 1}"], *tail_args)
+                tt_token_id, tt_top5 = first_token_from_logits(tt_logits, tokenizer)
+                for rank, (tid, prob, text) in enumerate(tt_top5, start=1):
+                    logger.info(f"  TT top{rank}: ID={tid:6d} | prob={prob * 100:6.2f}% | {text!r}")
+                if trace is not None:
+                    ref_token_id = int(trace.logits.reshape(-1).argmax().item())
+                    ref_source = "trace.logits"
+                else:
+                    # Same host tail over the HF reference's last-layer hidden state. Index by layer
+                    # (snapshot 0 is embed), not [-1]: a reference cache written before the tail was
+                    # removed still carries trailing norm / lm_head snapshots.
+                    ref_token_id = int(host_tail_logits(ref_snapshots[num_layers], *tail_args).argmax().item())
+                    ref_source = "HF layer_{N-1} + host tail"
+                match = log_and_compare_first_token(tt_token_id, ref_token_id, tokenizer, ref_source)
+                pcc_results.append(("first_token_match", 1.0 if match else 0.0))
+                del norm_weight, lm_head_weight, tail_weights, tt_logits
+                gc.collect()
 
         profiler.end("pcc_validation")
 
