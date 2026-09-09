@@ -1069,6 +1069,23 @@ def log_and_compare_first_token(tt_token_id: int, ref_token_id: int, tokenizer, 
     return match
 
 
+def trace_first_token_id(trace, trace_dir: Path) -> tuple[int | None, str | None]:
+    """The golden's recorded next token ``(id, text)`` from ``metadata.json`` or ``output_metadata.json``.
+
+    Returns ``(None, None)`` when the trace records neither; the caller then logs N/A and does not fail.
+    """
+    ref_token_id = trace.metadata.get("next_token_id")
+    ref_token_text = trace.metadata.get("next_token_text")
+    if ref_token_id is None or ref_token_text is None:
+        output_meta_path = (Path(trace_dir) / "output_metadata.json").resolve()
+        if output_meta_path.exists():
+            with open(output_meta_path) as f:
+                output_meta = json.load(f)
+            ref_token_id = ref_token_id if ref_token_id is not None else output_meta.get("next_token_id")
+            ref_token_text = ref_token_text if ref_token_text is not None else output_meta.get("next_token_text")
+    return (int(ref_token_id) if ref_token_id is not None else None), ref_token_text
+
+
 # --- Tokenization helpers ---
 def tokenize_prompt_to_isl(
     tokenizer, max_isl: int, prompt_text: str = "Capital of France is", debug: bool = False
@@ -1193,7 +1210,6 @@ class DebugTraceData:
     token_ids: torch.Tensor  # [1, seq_len] int64
     ref_snapshots: dict[str, torch.Tensor]  # label -> [1, seq, hidden_dim] bfloat16
     ref_kvpe_list: list[torch.Tensor]  # per-layer [1, 1, seq, kv_lora_rank + qk_rope_head_dim]
-    logits: torch.Tensor | None  # [1, vocab] float32: the traced FULL model's final-position logits, or None
     metadata: dict  # raw metadata.json contents
 
 
@@ -1228,10 +1244,9 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         num_layers: Number of layers to load (default: all layers from metadata)
 
     Returns:
-        DebugTraceData with token_ids, per-layer reference snapshots, KVPE cache, and the golden's
-        final-position logits (`logits.safetensors`, key `logits`) when the trace has them. The logits
-        are only a reference for the full-model first-token check (see `host_tail_logits`); the
-        per-layer / KVPE PCC rows never use them. `next_token_id` is not read.
+        DebugTraceData with token_ids, per-layer reference snapshots, and KVPE cache. A trace's
+        `logits.safetensors` is not read: the TT prefill transformer has no LM head. `metadata` is kept
+        whole, so `trace_first_token_id` can look up `next_token_id` for the full-model first-token check.
     """
     from safetensors import safe_open
 
@@ -1325,20 +1340,10 @@ def load_debug_trace(trace_dir: Path, num_layers: int | None = None, isl: int | 
         kv_format = "post-transform" if use_post_transform else "pre-transform (legacy)"
         logger.info(f"Loaded {len(ref_kvpe_list)} KVPE layers from kv_cache.safetensors ({kv_format})")
 
-    # Final-position logits of the traced full model, when the tracer saved them. Reference for the
-    # host-side first-token check only; meaningless for a sliced trace (see slice_debug_trace).
-    logits = None
-    logits_path = trace_dir / "logits.safetensors"
-    if logits_path.exists():
-        with safe_open(logits_path, framework="pt") as f:
-            logits = f.get_tensor("logits")
-        logger.info(f"Loaded golden logits: shape={list(logits.shape)}, dtype={logits.dtype}")
-
     return DebugTraceData(
         token_ids=token_ids,
         ref_snapshots=ref_snapshots,
         ref_kvpe_list=ref_kvpe_list,
-        logits=logits,
         metadata=metadata,
     )
 
@@ -1352,9 +1357,8 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
     RoPE), so they are identical whether the full sequence or only its first ``isl_total``
     tokens are prefilled.
 
-    The stored ``logits`` are the FULL sequence's final-position product and do not describe the
-    sliced prefix, so they are dropped (``None``): the first-token check is skipped for a sliced
-    trace. ``metadata`` is left untouched; nothing reads its ``next_token_id``.
+    ``metadata`` is left untouched, so its ``next_token_id`` (the FULL sequence's final-position
+    product) does not describe the sliced prefix: the first-token check is skipped for a sliced trace.
 
     Args:
         trace: Trace to slice (typically longer than the requested isl).
@@ -1370,7 +1374,6 @@ def slice_debug_trace(trace: DebugTraceData, isl_total: int) -> DebugTraceData:
         token_ids=trace.token_ids[:, :isl_total],
         ref_snapshots={label: snap[:, :isl_total, :] for label, snap in trace.ref_snapshots.items()},
         ref_kvpe_list=[kv[:, :, :isl_total, :] for kv in trace.ref_kvpe_list],
-        logits=None,  # full-sequence final-position logits are not a reference for the prefix
         metadata=trace.metadata,
     )
 

@@ -71,6 +71,7 @@ from models.demos.deepseek_v3_d_p.utils.transformer_helpers import (
     slice_debug_trace,
     slice_non_padded,
     tokenize_prompt_to_isl,
+    trace_first_token_id,
 )
 from tests.ttnn.utils_for_testing import comp_pcc
 
@@ -622,13 +623,27 @@ def run_model(
                     pcc_results.append((f"{label}_kv", -1.0))
                     pcc_results.append((f"{label}_pe", -1.0))
 
-        # --- First token (host-side tail) ---
-        # The device has no norm / LM-head tail, so the token is derived on the CPU from the last
-        # layer's hidden state and compared with the reference's first token. Full model only: a
-        # truncated model's argmax means nothing. The row is pass/fail (1.0 / 0.0), not a PCC.
+        profiler.end("pcc_validation")
+
+        # --- Summary table ---
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{'Stage':<20s}  {'PCC':>10s}  {'Status':>8s}")
+        logger.info(f"{'-'*50}")
+        failures = []
+        for label, pcc in pcc_results:
+            status = "PASS" if pcc >= threshold else ("FAIL" if pcc >= 0 else "ERROR")
+            logger.info(f"{label:<20s}  {pcc:>10.6f}  {status:>8s}")
+            if pcc < threshold:
+                failures.append((label, pcc))
+        logger.info(f"{'='*50}")
+
+        # --- First token ---
+        # The device has no norm / LM-head tail, so the token is derived on the CPU from the last layer's
+        # hidden state, then cross-checked against the reference exactly as before: full model only, a
+        # mismatch is a failure, a reference without a recorded token is N/A.
         trace_full_model = trace is not None and not trace_sliced and num_layers == trace.metadata.get("n_layers")
         host_full_model = trace is None and ref_snapshots is not None and num_layers == config.num_hidden_layers
-        if use_pretrained and ((trace_full_model and trace.logits is not None) or host_full_model):
+        if use_pretrained and (trace_full_model or host_full_model):
             tail_weights = load_host_tail_weights(model_path, config)
             if tail_weights is not None:
                 norm_weight, lm_head_weight = tail_weights
@@ -643,42 +658,25 @@ def run_model(
                 tt_token_id, tt_top5 = first_token_from_logits(tt_logits, tokenizer)
                 for rank, (tid, prob, text) in enumerate(tt_top5, start=1):
                     logger.info(f"  TT top{rank}: ID={tid:6d} | prob={prob * 100:6.2f}% | {text!r}")
-                if trace is not None:
-                    ref_token_id = int(trace.logits.reshape(-1).argmax().item())
-                    ref_source = "trace.logits"
+                if trace_full_model:
+                    ref_token_id, ref_token_text = trace_first_token_id(trace, trace_dir)
+                    ref_source = "trace next_token_id"
+                    if ref_token_id is None:
+                        logger.info(f"Trace first token: TT={tt_token_id}, Trace=N/A [{ref_token_text!r}], Match=N/A")
                 else:
                     # Same host tail over the HF reference's last-layer hidden state. Index by layer
                     # (snapshot 0 is embed), not [-1]: a reference cache written before the tail was
                     # removed still carries trailing norm / lm_head snapshots.
                     ref_token_id = int(host_tail_logits(ref_snapshots[num_layers], *tail_args).argmax().item())
                     ref_source = "HF layer_{N-1} + host tail"
-                match = log_and_compare_first_token(tt_token_id, ref_token_id, tokenizer, ref_source)
-                pcc_results.append(("first_token_match", 1.0 if match else 0.0))
+                if ref_token_id is not None and not log_and_compare_first_token(
+                    tt_token_id, ref_token_id, tokenizer, ref_source
+                ):
+                    failures.append(("first_token_match", -1.0))
                 del norm_weight, lm_head_weight, tail_weights, tt_logits
                 gc.collect()
-        elif trace is not None and not trace_full_model:
-            reason = (
-                "trace sliced to a shorter isl (full-sequence logits/next-token invalid)"
-                if trace_sliced
-                else f"num_layers={num_layers} != trace n_layers={trace.metadata.get('n_layers')}"
-            )
-            logger.info(f"Skipping trace first-token check: {reason}")
         else:
             logger.debug("Skipping first token check")
-
-        profiler.end("pcc_validation")
-
-        # --- Summary table ---
-        logger.info(f"\n{'='*50}")
-        logger.info(f"{'Stage':<20s}  {'PCC':>10s}  {'Status':>8s}")
-        logger.info(f"{'-'*50}")
-        failures = []
-        for label, pcc in pcc_results:
-            status = "PASS" if pcc >= threshold else ("FAIL" if pcc >= 0 else "ERROR")
-            logger.info(f"{label:<20s}  {pcc:>10.6f}  {status:>8s}")
-            if pcc < threshold:
-                failures.append((label, pcc))
-        logger.info(f"{'='*50}")
 
         has_pcc_failures = len(failures) > 0
 
