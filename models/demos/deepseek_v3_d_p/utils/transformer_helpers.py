@@ -1023,12 +1023,17 @@ def execute_tail_host(
 
     Returns that token's logits, ``[vocab]`` fp32.
     """
+    # --- Pick the last real token ---
     h = hidden.reshape(-1, hidden.shape[-1])  # [seq, emb]
     last_idx = num_real_tokens - 1 if padding_side == "right" else h.shape[0] - 1
     x = h[last_idx : last_idx + 1]  # [1, emb], keeps the device dtype (bf16)
+
+    # --- Final RMSNorm (same op order as the HF reference: fp32 variance, cast back, then gain) ---
     xf = x.to(torch.float32)
     xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     normed = (norm_weight.to(x.dtype) * xf.to(x.dtype)).to(torch.float32)  # [1, emb]
+
+    # --- LM head: logits = normed @ W^T, in fp32, over vocab chunks so W is never copied whole to fp32 ---
     vocab = lm_head_weight.shape[0]
     logits = torch.empty(vocab, dtype=torch.float32)
     with torch.no_grad():
