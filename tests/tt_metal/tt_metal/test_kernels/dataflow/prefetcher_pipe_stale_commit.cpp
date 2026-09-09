@@ -36,7 +36,7 @@ FORCE_INLINE void test_stale_commit_after_resize(
     iface.fifo_wr_ptr = iface.fifo_start_addr + dfb.derived_wr_offset(iface, 0);
     dfb.resize_sender_interface<false>(new_entry_size, noc_index);
     volatile tt_l1_ptr uint32_t* config = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(iface.config_ptr);
-    config[PREFETCHER_PIPE_CFG_APPLIED_ENTRY_SIZE] = iface.fifo_page_size;
+    store_prefetcher_pipe_config_word(config, PREFETCHER_PIPE_CFG_APPLIED_ENTRY_SIZE, iface.fifo_page_size);
 
     // Make the stale iface resolve to a distinct, valid credit-derived cursor.
     volatile tt_l1_ptr uint32_t* sent_ptr = dfb.local_sent_ptr(iface, 0);
