@@ -614,7 +614,7 @@ class TtPrefillRuntime:
         set_layer_completion_sink), the model fires that once per layer instead.
 
         Always returns None on the last rank: the populated KV cache is the output (decode owns the
-        LM head). When `kv_only_last_layer` is set on the config the last layer's compute is stripped
+        token sampling). When `kv_only_last_layer` is set on the config the last layer's compute is stripped
         down to the KV cache fill, which migration consumes.
 
         Args:
