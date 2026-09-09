@@ -1017,30 +1017,37 @@ def execute_tail_host(
     norm_weight: torch.Tensor,
     lm_head_weight: torch.Tensor,
     eps: float,
+    activations_dtype: torch.dtype = torch.float32,
     vocab_chunk: int = 16384,
 ) -> torch.Tensor:
     """Run the tail (final RMSNorm + LM head) on the CPU for the last real token of ``hidden``.
 
-    Returns that token's logits, ``[vocab]`` fp32.
+    ``activations_dtype`` is the dtype every op takes in and gives out, matched to the reference:
+    bf16 when the reference is a GPU trace (its ops ran bf16 -> bf16, fp32 only inside the
+    accumulation), fp32 when the reference is the fp32 HF model. Returns the token's logits ``[vocab]``.
     """
     # --- Pick the last real token ---
     h = hidden.reshape(-1, hidden.shape[-1])  # [seq, emb]
     last_idx = num_real_tokens - 1 if padding_side == "right" else h.shape[0] - 1
-    x = h[last_idx : last_idx + 1]  # [1, emb], keeps the device dtype (bf16)
+    x = h[last_idx : last_idx + 1].to(activations_dtype)  # [1, emb]
 
     # --- Final RMSNorm (same op order as the HF reference: fp32 variance, cast back, then gain) ---
     xf = x.to(torch.float32)
     xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    normed = (norm_weight.to(x.dtype) * xf.to(x.dtype)).to(torch.float32)  # [1, emb]
+    normed = norm_weight.to(activations_dtype) * xf.to(activations_dtype)  # [1, emb]
 
-    # --- LM head: logits = normed @ W^T, in fp32, over vocab chunks so W is never copied whole to fp32 ---
-    vocab = lm_head_weight.shape[0]
-    logits = torch.empty(vocab, dtype=torch.float32)
+    # --- LM head: logits = normed @ W^T ---
     with torch.no_grad():
+        if activations_dtype == torch.bfloat16:
+            # bf16 in, bf16 out; torch accumulates in fp32 inside, like the GPU kernel.
+            return (normed @ lm_head_weight.to(torch.bfloat16).T).reshape(-1)
+        # fp32: cast W in vocab chunks so it is never copied whole to fp32.
+        vocab = lm_head_weight.shape[0]
+        logits = torch.empty(vocab, dtype=torch.float32)
         for start in range(0, vocab, vocab_chunk):
             w = lm_head_weight[start : start + vocab_chunk].to(torch.float32)  # [chunk, emb]
-            logits[start : start + w.shape[0]] = (normed @ w.T).reshape(-1)
-    return logits
+            logits[start : start + w.shape[0]] = (normed.to(torch.float32) @ w.T).reshape(-1)
+        return logits
 
 
 def first_token_from_logits(

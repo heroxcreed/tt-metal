@@ -647,12 +647,14 @@ def run_model(
             tail_weights = load_host_tail_weights(model_path, config)
             if tail_weights is not None:
                 norm_weight, lm_head_weight = tail_weights
+                # Every tail op runs in the reference's dtype: bf16 -> bf16 like the GPU trace, fp32 like HF.
                 tail_args = (
                     number_of_non_padded_tokens,
                     padding_side,
                     norm_weight,
                     lm_head_weight,
                     config.rms_norm_eps,
+                    torch.bfloat16 if trace_full_model else torch.float32,
                 )
                 tt_logits = execute_tail_host(tt_intermediates[f"layer_{num_layers - 1}"], *tail_args)
                 tt_token_id, tt_top5 = first_token_from_logits(tt_logits, tokenizer)
