@@ -57,10 +57,10 @@ from models.demos.deepseek_v3_d_p.utils.transformer_helpers import (
     check_reference_cache_exists,
     create_hf_model,
     download_infinitebench_subset,
+    execute_tail_host,
     extract_tt_state_dict,
     find_trace_dir,
     first_token_from_logits,
-    host_tail_logits,
     load_and_compute_layer_by_layer,
     load_debug_trace,
     load_host_tail_weights,
@@ -654,7 +654,7 @@ def run_model(
                     lm_head_weight,
                     config.rms_norm_eps,
                 )
-                tt_logits = host_tail_logits(tt_intermediates[f"layer_{num_layers - 1}"], *tail_args)
+                tt_logits = execute_tail_host(tt_intermediates[f"layer_{num_layers - 1}"], *tail_args)
                 tt_token_id, tt_top5 = first_token_from_logits(tt_logits, tokenizer)
                 for rank, (tid, prob, text) in enumerate(tt_top5, start=1):
                     logger.info(f"  TT top{rank}: ID={tid:6d} | prob={prob * 100:6.2f}% | {text!r}")
@@ -667,7 +667,7 @@ def run_model(
                     # Same host tail over the HF reference's last-layer hidden state. Index by layer
                     # (snapshot 0 is embed), not [-1]: a reference cache written before the tail was
                     # removed still carries trailing norm / lm_head snapshots.
-                    ref_token_id = int(host_tail_logits(ref_snapshots[num_layers], *tail_args).argmax().item())
+                    ref_token_id = int(execute_tail_host(ref_snapshots[num_layers], *tail_args).argmax().item())
                     ref_source = "HF layer_{N-1} + host tail"
                 if ref_token_id is not None and not log_and_compare_first_token(
                     tt_token_id, ref_token_id, tokenizer, ref_source

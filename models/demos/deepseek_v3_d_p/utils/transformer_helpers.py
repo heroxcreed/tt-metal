@@ -1010,7 +1010,7 @@ def load_host_tail_weights(model_path, config) -> tuple[torch.Tensor, torch.Tens
     return norm_weight, lm_head_weight
 
 
-def host_tail_logits(
+def execute_tail_host(
     hidden: torch.Tensor,
     num_real_tokens: int,
     padding_side: str,
@@ -1019,12 +1019,9 @@ def host_tail_logits(
     eps: float,
     vocab_chunk: int = 16384,
 ) -> torch.Tensor:
-    """Final RMSNorm + LM head on the CPU for the LAST REAL token of ``hidden`` -> logits ``[vocab]`` fp32.
+    """Run the tail (final RMSNorm + LM head) on the CPU for the last real token of ``hidden``.
 
-    ``hidden`` is a full-sequence hidden state ``[1, seq, emb]`` (or ``[seq, emb]``); the last real
-    position follows the same convention as :func:`slice_non_padded`. RMSNorm mirrors the HF reference
-    (``DeepseekV3RMSNorm``: fp32 variance, cast back to the input dtype, then the gain). The projection
-    runs in fp32 in ``vocab_chunk``-row slabs so the bf16 LM-head weight is never copied whole to fp32.
+    Returns that token's logits, ``[vocab]`` fp32.
     """
     h = hidden.reshape(-1, hidden.shape[-1])  # [seq, emb]
     last_idx = num_real_tokens - 1 if padding_side == "right" else h.shape[0] - 1
