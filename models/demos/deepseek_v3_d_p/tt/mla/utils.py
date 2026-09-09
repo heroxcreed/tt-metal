@@ -163,3 +163,48 @@ def blockcyclic_cache_host(
     valid = p < prior_len
     out[valid] = kv_natural[p[valid]]
     return out.reshape(1, 1, seq_len_cache, kvpe_dim)
+
+
+def global_to_local_token_id(
+    global_token_id: int,
+    sp_factor: int,
+    seq_len: int,
+    is_balanced: bool = True,
+) -> tuple[int, int]:
+    """Convert a global token ID to a device ID and local token ID.
+
+    Args:
+        global_token_id: The global token position across the full sequence.
+        sp_factor: Number of devices in the sequence parallel group.
+        seq_len: Total sequence length across all devices.
+        is_balanced: If True (default), uses zigzag (striped) attention where the sequence
+            is split into 2*sp_factor chunks and device k holds chunks k and (2*sp_factor - 1 - k),
+            balancing causal attention workload. If False, uses sequential distribution where
+            the sequence is split into sp_factor chunks and device k holds chunk k.
+
+    Returns:
+        A tuple of (device_id, local_token_id).
+    """
+    if is_balanced:
+        # Zigzag/balanced: num_chunks = 2 * sp_factor
+        num_chunks = 2 * sp_factor
+        chunk_size = seq_len // num_chunks
+        chunk_id = global_token_id // chunk_size
+        offset_in_chunk = global_token_id % chunk_size
+
+        if chunk_id < sp_factor:
+            device_id = chunk_id
+            local_token_id = offset_in_chunk
+        else:
+            device_id = num_chunks - 1 - chunk_id
+            local_token_id = chunk_size + offset_in_chunk
+    else:
+        # Sequential: num_chunks = sp_factor
+        num_chunks = sp_factor
+        chunk_size = seq_len // num_chunks
+        chunk_id = global_token_id // chunk_size
+        offset_in_chunk = global_token_id % chunk_size
+        device_id = chunk_id
+        local_token_id = offset_in_chunk
+
+    return device_id, local_token_id
