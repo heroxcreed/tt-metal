@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """vsa_sdpa timed on REAL selections: a VSA_DUMP_INDICES dump (models/.../attention_minimax_h3.py) gives one
 device's raw top-k rows; q/k/v are random at the real 15 s / 768p shape. Knobs: VSA_REAL_DUMP (file),
-VSA_REAL_DEV (device index, default 5), VSA_ORDERS (comma list of identity|canonical|zorder), TT_VSA_RMAX/DEPTH.
+VSA_REAL_DEV (device index, default 5), VSA_ORDERS (comma list of identity|canonical|zorder|stride), TT_VSA_RMAX/DEPTH.
 Run: ./scripts/run_safe_pytest.sh <this file> -q -s"""
 
 import os
@@ -32,6 +32,11 @@ def _stream_order(tile_ids, n_prefix, grid, kind):
         c = int(tile_ids[slot])
         if c < n_prefix:
             keys.append((0, slot))
+            continue
+        if kind == "stride":
+            # de-clustering order: spatial neighbours land far apart in the stream, so a core's listed
+            # blocks (spatially clustered per row) spread evenly over the arrivals (977 is coprime to n)
+            keys.append((1, (slot * 977) % n))
             continue
         v = c - n_prefix
         ct, ch, cw = v // (hh * wh), (v // wh) % hh, v % wh

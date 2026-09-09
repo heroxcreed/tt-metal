@@ -18,6 +18,16 @@
 #include "dataflow_common.hpp"
 #include "vsa_sum_service.hpp"
 #include "api/debug/dprint.h"
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+#define VSA_TICK() (*reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L))
+#endif
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+#define VSA_T0(var) const uint32_t var = VSA_TICK()
+#define VSA_ACC(acc, var) acc += VSA_TICK() - var
+#else
+#define VSA_T0(var) ((void)0)
+#define VSA_ACC(acc, var) ((void)0)
+#endif
 
 constexpr uint32_t one_bf16_packed = 0x3F803F80u;
 
@@ -162,6 +172,14 @@ void kernel_main() {
                     fetch_one(b1, s1);
                 }
             }
+            // Idle: ack every fetched block that has landed (non-blocking trid check). The reader
+            // publishes its whole prefetch queue before blocking on a slot gate, so acks gated on
+            // the NEXT kreq would deadlock it (the next kreq comes only after the gate).
+            while (nacked < nfetch && ncrisc_noc_read_with_transaction_id_flushed(noc.get_noc_id(), (nacked % 8) + 1)) {
+                kack_cb.reserve_back(1);
+                kack_cb.push_back(1);
+                ++nacked;
+            }
             if (row_count > 0 && pass_base < row_count && drained >= pass_base) {
                 const uint32_t pass_rows = get_arg_val<uint32_t>(kPassArg + pass_i++);
                 for (uint32_t r = 0; r < pass_rows; ++r) {
@@ -217,7 +235,12 @@ void kernel_main() {
     // marker kreq {0xFFFFFFFF, half} queues a LAZY ack: it is pushed, in marker order, once a
     // non-blocking check says that half's pulls landed -- never a blocking drain (the reader's
     // symmetric V-side blocking drain measured 60% of its wall time).
-    uint32_t pull_idx[2] = {0, 0};       // pulls issued in the open window of each half
+#ifndef VSA_STAGES
+#define VSA_STAGES 2
+#endif
+    constexpr uint32_t kStages = VSA_STAGES;  // ring stages (see vsa_sdpa_stream_reader.cpp)
+    static_assert(kStages * 4 + 1 <= 16, "kStages: trid groups");
+    uint32_t pull_idx[kStages] = {};     // pulls issued in the open window of each stage
     uint32_t ack_pending[4];             // FIFO of marker halves awaiting their lazy ack
     uint32_t ack_head = 0, ack_tail = 0;
     const auto khalf_landed = [&](uint32_t h) {
@@ -247,7 +270,7 @@ void kernel_main() {
             }
             kreq_cb.pop_front(1);
             if (leader_slot == 0xFFFFFFFFu) {  // window end: queue the lazy ack
-                ASSERT(khalf < 2);             // indexes pull_idx[] and the per-half trid groups
+                ASSERT(khalf < kStages);       // indexes pull_idx[] and the per-stage trid groups
                 ack_pending[ack_tail & 3] = khalf;
                 ++ack_tail;
                 pull_idx[khalf] = 0;
@@ -269,6 +292,12 @@ void kernel_main() {
         }
     };
 
+    uint32_t st_serve = 0, st_kreq = 0;  // probe-9 writer timers
+    (void)st_serve;
+    (void)st_kreq;
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+    const uint32_t st_begin = VSA_TICK();
+#endif
     while (pass_base < row_count || drained < row_count) {
         if (pass_base < row_count && drained >= pass_base) {
             const uint32_t pass_rows = get_arg_val<uint32_t>(kPassArg + pass_i++);
@@ -289,8 +318,12 @@ void kernel_main() {
             pass_base += pass_rows;
         }
 
+        VSA_T0(q0);
         serve_kreq_if_any();
+        VSA_ACC(st_kreq, q0);
+        VSA_T0(v0);
         VSA_SERVE();  // one 16-row slice at most: bounded delay for the K service
+        VSA_ACC(st_serve, v0);
 
         if (cb_pages_available_at_front(cb_out, out_tiles_per_row)) {
             out_cb.wait_front(out_tiles_per_row);
@@ -305,5 +338,8 @@ void kernel_main() {
             ++drained;
         }
     }
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+    DPRINT("VSAS total={} kreq={} serve={}\n", VSA_TICK() - st_begin, st_kreq, st_serve);
+#endif
 #endif  // VSA_IS_LEADER
 }

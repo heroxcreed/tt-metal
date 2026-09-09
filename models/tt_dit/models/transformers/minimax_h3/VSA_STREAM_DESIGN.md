@@ -380,12 +380,14 @@ real rows: `VSA_REAL_DUMP`, `VSA_REAL_DEV`, `VSA_ORDERS`).
 
 ## 6. Knobs and tools
 
-- `TT_VSA_RMAX`, `TT_VSA_DEPTH`: resident rows per pass / stream depth (defaults 15 / 12; 14 fits
-  an empty L1 only). A depth-18 configuration once hung (cb_corr sizing, fixed); treat non-default
-  knob values as experimental.
-- `TT_VSA_PROBE`: 1 delivery floor, 2 math floor, 3 protocol-only floor, 7 print CB layout, 9
-  per-TRISC phase timers (DPRINT `VSAC ...`, incl. `moved=` anchor moves / non-first visits). Output
-  is garbage in probe modes. `TT_VSA_OS=1` builds the dataflow kernels -Os so probe/DPRINT builds fit.
+- `TT_VSA_RMAX`, `TT_VSA_DEPTH`, `TT_VSA_STAGES`: resident rows per pass / stream depth / ring stages
+  (defaults 10 / 20 / 2; depth must be a multiple of stages, 24 overflows L1). `TT_VSA_LEADER_ROWS=0`
+  (pure streaming leader) and `TT_VSA_LEADER_SHARE=<pct>` (leader's row share) are measured-worse
+  experiment knobs (section 10).
+- `TT_VSA_PROBE`: 1 delivery floor, 7 print CB layout, 9 per-RISC timers (DPRINT `VSAC` compute phases
+  per TRISC incl. `moved=`, `VSAL` leader gates/publish/V-issue, `VSAW` worker reader spin/credit/emit,
+  `VSAS` worker writer kreq/sum service). Probes 2 and 3 are no longer implemented. Output is garbage in
+  probe modes. `TT_VSA_OS=1` builds the dataflow kernels -Os so probe/DPRINT builds fit.
 - `TT_VSA_LAZY_T`: lazy-rescale threshold in logits (default 2; see 7). `VSA_NO_SUMS=1`: skip the
   exact row-sum traffic and its math (timing-only, garbage output).
 - `scripts/profile_block.sh` (`MODES`/`DURS`/`OUT`): Tracy block profiles dense vs VSA; `scripts/run_h3_test.sh`:
@@ -518,3 +520,72 @@ overlap here.
 
 What remains on the pre-attention critical path is the pair of K/V all-gathers (8.1 ms, CCL cores only,
 nothing else running); everything else in the coarse stage is now ~3.4 ms and largely overlapped.
+
+## 10. Kernel lever pass (2026-09-09): where the time goes, what moved, what did not
+
+Method: `TT_VSA_PROBE=9` now carries timers on all five RISCs (compute phases per TRISC, and new
+`VSAL` leader / `VSAW` worker-reader / `VSAS` worker-writer lines), read on the real device-5 indices of
+the 15 s / 768p shard (226 rows, 179 listed blocks per sparse row, 2 dense rows). Every number below is
+that shard unless marked synthetic. The full running log of the pass is `VSA_LEVERS_LOG.md`.
+
+**Baseline (v19 as committed):** 23.0 ms. Compute TRISCs idle 43-47 % waiting for the next window;
+phases on MATH: QK 13 %, candidate max + decision 17 %, deferred PV + partial sums 15 %, exp 7 %,
+flush 3 %. Delivery floor (probe 1) 10.05 ms; compute busy ~12.7 ms; the two add up to the total.
+
+**Lever 2 - the lazy-max decision (shipped, -2.5 ms).** Skipping only the per-visit decision (candidate
+vs threshold, 64 rows) took the kernel from 22.6 to 18.9 ms: two sets of 64 strided L1 reads per visit on
+the UNPACK RISC while MATH and PACK sat at the mailbox. Same decision, cheaper: the threshold keys are
+cached contiguously per row slot in the unused `cb_sum_res` tile (pre-transformed to order-preserving
+integer keys, refreshed only for rows whose threshold changed: first visit or move, tracked by per-thread
+dirty bits), and the visits are split even/odd between the UNPACK and MATH RISCs. The MATH RISC waits on
+the packer through `PACK_DONE` (semaphore 4, initialised by the firmware, unused by the LLKs), the two
+masks are exchanged by mailbox and all three threads branch on the same `updated`. The decision now costs
+~1.2 ms. Anchor copies were measured free; the reduce + pack of the candidates is ~1.2 ms.
+
+**Ring depth (shipped: 2 stages, depth 18).** With the decision cheap, wider windows win: 2x10 (depth 20)
+19.1-19.2 ms, 2x9 (depth 18) 19.6 ms, 2x8 19.7, 3x6 20.1, 3x7 20.3; depth 24 overflows L1 by
+59 KB standalone, and depth 20 clashes with the model's live L1 buffers by 15-25 KB in the traced block and
+attention tests (`TT_VSA_DEPTH=20` remains available standalone).
+
+**Lever 1 - a third ring stage (built, kept opt-in, not default).** `TT_VSA_STAGES` generalises the
+worker's two window halves to N stages (reader pending lists, trid groups, leader-as-worker window,
+writer acks). Hypothesis: with two halves (computing + holding the deferred PV's credits) the fill of the
+next window is exposed after every window. Result: 23.08 -> 22.60 ms, wait 44 % -> 40 %, +18 % visits
+from the narrower windows; neutral-to-worse once the decision was cheap. Not the coupling.
+
+**Things measured and rejected (all on the real shard):**
+- pure streaming leader (`TT_VSA_LEADER_ROWS=0`): 24.8 ms; leader row share 30-70 %
+  (`TT_VSA_LEADER_SHARE`): 21.3-21.7 vs 19.1. The leader's own compute is not the laggard; moving its
+  rows to workers makes their bursts larger.
+- `cb_ctrl` 8 -> 64 pages: no change (kept; 3.5 KB).
+- publishing the leader's prefetch queue before blocking on a slot gate (with the leader writer acking
+  landed blocks whenever idle, which the drain needs - the first attempt deadlocked on the lazy ack):
+  neutral, kept. It also removed the latent deadlock of permuted stream orders (`stream_order` runs now).
+- worker window bins spanning the whole ring (close on full slots): neutral, and it breaks the
+  raw-vs-assembled bit-equality because the partition then depends on co-resident rows; reverted.
+- de-clustering stream orders: stride 19.9, Z-order 20.6 vs identity 19.0.
+- rmax 8 / 12: 23.1 / 22.9 vs 22.6 at 10.
+
+**What the dataflow timers say (2 stages, depth 20 standalone).** Leader reader: waiting on its own compute's
+credits 30 %, on the workers' progress 17 %, V-read issue 20 % (8 interleaved tile reads through the
+tensor accessor, ~940 ticks per block), publish 13 %, own-consume 9 %. Worker readers: 62-87 % spinning
+for the next log entry, 5-29 % waiting for compute credits. Worker writers: 43 % in the exact row-sum
+service, 34 % issuing K pulls. Close-to-emit latency of worker windows is negligible. Real selections are
+spatially clustered: a worker closed 230-338 non-empty windows over 5406 arrivals, i.e. long stretches
+with nothing for its rows, then bursts. Per-window compute is bursty while the leader's fetch per window
+is constant, and an 18-20 arrival ring cannot absorb it: the leader stalls on the slowest consumer and
+everyone else's compute idles. Aggregate timers cannot show which consumer gates which window; the next
+step is an event timeline (leader publish / gate enter-exit, compute window start-end) in an L1 trace
+buffer, not more hypotheses.
+
+**Remaining levers, in order:** (1) the event timeline above (the 40 % compute idle is worth ~8 ms if it
+can be overlapped); (2) the leader's V-read issue cost (precomputed per-bank addresses instead of the
+accessor: tiles 8b..8b+7 of a block sit at the same offset in the 8 DRAM banks); (3) the exact row-sum
+service (1.3 ms, and 43 % of the worker writer); (4) the K/V all-gather reorder at block level (~3 ms,
+independent of the kernel).
+
+**Shipped result (2 stages, depth 18):** real device-5 shard 23.0 -> 19.6 ms standalone; synthetic median-model
+shard 19.7 -> 16.5 ms (23.9 % of HiFi2 peak on the listed math). In the 15 s block (Tracy): `vsa_sdpa`
+21.5 -> 17.5 ms (slowest device), block period 64.0 -> 59.8 ms. Gates: 47 unit cases (incl. distributed),
+determinism / precision / trace (17), coarse+fine oracle (11), attention oracle 99.51-99.57 %, sparsity-0
+99.97 %, traced 15 s block bit-exact on replay.

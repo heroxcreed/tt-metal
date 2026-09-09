@@ -34,7 +34,22 @@
 #include "sparse_sdpa_msa_gather.hpp"
 #include "dataflow_common.hpp"
 
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+#define VSA_T0(var) const uint32_t var = VSA_TICK()
+#define VSA_ACC(acc, var) acc += VSA_TICK() - var
+#else
+#define VSA_T0(var) ((void)0)
+#define VSA_ACC(acc, var) ((void)0)
+#endif
 constexpr uint32_t sentinel = 0xFFFFFFFFu;
+#ifndef VSA_STAGES
+#define VSA_STAGES 2
+#endif
+// Ring stages per worker: windows in flight (filling / computing / holding the deferred PV's
+// credits). A "half" below is one stage (the name predates the third). Per-stage NoC trid groups
+// are 4 wide, so at most 3 stages fit trids 1..15.
+constexpr uint32_t kStages = VSA_STAGES;
+static_assert(kStages >= 2 && kStages * 4 + 1 <= 16, "kStages: trid groups");
 
 // Diagnostic traps: a corrupt protocol word parks the RISC in a NAMED loop so a hang triage
 // points at the corruption instead of at whoever was waiting on it.
@@ -262,6 +277,18 @@ void kernel_main() {
             ackbox[kAckboxReady + w] = 0;
         }
         uint32_t arrival_dbg = 0, fetched_dbg = 0;
+        uint32_t pt_gate = 0, pt_own = 0, pt_kack = 0, pt_vbar = 0;  // probe-9 leader timers
+        uint32_t pt_pub = 0, pt_cons = 0, pt_viss = 0;
+        (void)pt_gate;
+        (void)pt_own;
+        (void)pt_kack;
+        (void)pt_vbar;
+        (void)pt_pub;
+        (void)pt_cons;
+        (void)pt_viss;
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+        const uint32_t pt_begin = VSA_TICK();
+#endif
         const auto wait_all_workers_at = [&](uint32_t target) {
             for (uint32_t w = 0; w < n_workers; ++w) {
 #if defined(VSA_PROBE) && VSA_PROBE == 7
@@ -309,7 +336,7 @@ void kernel_main() {
         bitmap_cb.reserve_back(1);
         volatile tt_l1_ptr uint32_t* bitmaps = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(bitmap_cb.get_write_ptr());
         uint32_t own_row_parity = 0, own_row_seen = 0;
-        constexpr uint32_t kOwnWin = stream_depth / 2;
+        constexpr uint32_t kOwnWin = stream_depth / kStages;
         uint32_t own_pending[32][kOwnWin > 0 ? kOwnWin : 1];
         uint32_t own_np[32];
         uint32_t own_commit = 0, own_consumed = 0;
@@ -506,19 +533,27 @@ void kernel_main() {
         const auto publish_pending = [&](uint32_t k) {
             uint32_t bs[2], slots[2];
             for (uint32_t j = 0; j < k; ++j) {
+                VSA_T0(v0);
                 experimental::async_read_barrier_with_trid(noc, ((arrival + j) % 8) + 1);  // V landed
+                VSA_ACC(pt_vbar, v0);
                 WAYPOINT("LKAK");
+                VSA_T0(k0);
                 kack_cb.wait_front(1);  // K landed (writer acks per block, same pipelining)
+                VSA_ACC(pt_kack, k0);
                 kack_cb.pop_front(1);
                 bs[j] = pend_b[(arrival + j) % kFetchLag];
                 slots[j] = pend_slot[(arrival + j) % kFetchLag];
             }
+            VSA_T0(p0);
             publish_run(bs, slots, k);
+            VSA_ACC(pt_pub, p0);
             if (row_count > 0) {
+                VSA_T0(c0);
                 for (uint32_t j = 0; j < k; ++j) {
                     own_consume(bs[j], slots[j]);
                 }
                 own_poll_credits();
+                VSA_ACC(pt_cons, c0);
             }
             arrival += k;
         };
@@ -526,11 +561,36 @@ void kernel_main() {
         const auto issue_pair = [&](const uint32_t* bs, uint32_t k) {
             if (fetched + k > stream_depth) {
                 // Every consumer (workers AND the local compute) must be done with these slots.
+                const uint32_t target = fetched + k - stream_depth;
                 arrival_dbg = arrival;
                 fetched_dbg = fetched;
-                wait_all_workers_at(fetched + k - stream_depth);
+                // If the gate is closed, publish everything already fetched BEFORE waiting: the
+                // kFetchLag prefetch queue otherwise holds the tail of the open window unpublished
+                // for the whole stall, so no consumer can close that window and return the very
+                // credits this gate waits for (probe 9: leader 31% own-gate + 18% worker-gate,
+                // compute 40% idle). Checked non-blocking first so the steady state keeps its
+                // DRAM-latency hiding.
+                bool open = true;
+                invalidate_l1_cache();
+                for (uint32_t w = 0; w < n_workers && open; ++w) {
+                    open = ackbox[w] >= target;
+                }
+                if (open && row_count > 0) {
+                    own_poll_credits();
+                    open = own_commit >= target;
+                }
+                if (!open) {
+                    while (arrival < fetched) {
+                        publish_pending((fetched - arrival >= 2) ? 2 : 1);
+                    }
+                }
+                VSA_T0(g0);
+                wait_all_workers_at(target);
+                VSA_ACC(pt_gate, g0);
                 if (row_count > 0) {
-                    own_wait_at(fetched + k - stream_depth);
+                    VSA_T0(o0);
+                    own_wait_at(target);
+                    VSA_ACC(pt_own, o0);
                 }
             }
             kreq_cb.reserve_back(1);
@@ -543,6 +603,7 @@ void kernel_main() {
                 rq[3] = (fetched + 1) % stream_depth;
             }
             kreq_cb.push_back(1);
+            VSA_T0(vi0);
             for (uint32_t j = 0; j < k; ++j) {
                 const uint32_t slot = fetched % stream_depth;
                 experimental::set_read_trid(noc, (fetched % 8) + 1);
@@ -557,6 +618,7 @@ void kernel_main() {
                 pend_slot[fetched % kFetchLag] = slot;
                 ++fetched;
             }
+            VSA_ACC(pt_viss, vi0);
         };
         for (uint32_t pass = 0; pass < n_passes; ++pass) {
             const uint32_t pass_row_base = pass_base_acc;
@@ -687,6 +749,19 @@ void kernel_main() {
         wait_all_workers_at(arrival);
         noc.async_write_barrier();
         noc_async_atomic_barrier(noc.get_noc_id());
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+        DPRINT(
+            "VSAL total={} gate={} own={} kack={} vbar={} pub={} cons={} viss={} arrivals={}\n",
+            VSA_TICK() - pt_begin,
+            pt_gate,
+            pt_own,
+            pt_kack,
+            pt_vbar,
+            pt_pub,
+            pt_cons,
+            pt_viss,
+            arrival);
+#endif
         return;
     }
 #else
@@ -723,7 +798,8 @@ void kernel_main() {
     // Per-row running state parity (bit) and first-visit flag, tracked across a pass, plus the
     // per-half window-pending block lists: blocks pulled within one window are freed together
     // after the window's batched visits, so a row folds every block it lists in the window into
-    // ONE visit. The slot space is split into two window halves, double-buffered.
+    // ONE visit. The slot space is split into kStages window stages ("halves"), so a window can
+    // fill while another computes and a third holds the deferred PV's credits.
     //
     // Windows are emitted LAZILY: closing a window sends the writer its K marker and leaves the
     // window pending; its visits are emitted only once a NON-BLOCKING trid check says the half's
@@ -732,10 +808,15 @@ void kernel_main() {
     // of the reader's wall time (measured), stalled on leader-NIU congestion.
     uint32_t row_parity_bits = 0;
     uint32_t row_seen_bits = 0;
-    constexpr uint32_t half_slots = stream_depth / 2;
-    uint32_t pending[2][32][half_slots > 0 ? half_slots : 1];
-    uint32_t n_pending[2][32];
-    uint32_t half_outstanding[2] = {0, 0};  // credits still owed by compute for each half
+    constexpr uint32_t half_slots = stream_depth / kStages;  // arrivals per window bin = slots per stage
+    // The bin is exactly one stage of slots, so a window never closes on full slots before its bin
+    // boundary: a row's visit partition depends only on the arrival stream, never on which rows share
+    // the core (host-assembled and raw-selection encodings stay bit-identical). A bin spanning the
+    // whole ring was measured neutral (19.12 vs 19.19 ms) and loses that property.
+    constexpr uint32_t kBinArrivals = half_slots;
+    uint32_t pending[kStages][32][half_slots > 0 ? half_slots : 1];
+    uint32_t n_pending[kStages][32];
+    uint32_t half_outstanding[kStages] = {};  // credits still owed by compute for each stage
 
     // Progress mailbox: this worker's consumed-arrival count, staged locally (own ackbox word) and
     // posted to the leader's ackbox word for this worker (same word offset both sides: L1-to-L1
@@ -782,19 +863,33 @@ void kernel_main() {
         return true;
     };
 
-    // Pending (closed, not yet emitted) windows, oldest first; at most both halves.
+    // Pending (closed, not yet emitted) windows, oldest first; at most one per stage.
     struct PendingWin {
         uint32_t half;
         uint32_t n_slots;
         uint32_t first_listed;  // arrival index of its first listed block (post_limit source)
+        uint32_t t_close;       // probe 9: close timestamp
     };
-    PendingWin pendq[2];
+    uint32_t wt_lat = 0, wn_win = 0, wn_fail_v = 0, wn_fail_k = 0;  // probe 9: close->emit latency and causes
+    (void)wt_lat;
+    (void)wn_win;
+    (void)wn_fail_v;
+    (void)wn_fail_k;
+    PendingWin pendq[kStages];
     uint32_t pend_head = 0, pend_tail = 0;
     uint32_t half = 0;              // the half the OPEN window fills
     uint32_t window_slots = 0;      // pulled blocks in the open window
     uint32_t window_first_listed = 0xFFFFFFFFu;
     uint32_t cur_pass_rows = 0;
     uint32_t pass_base_acc = 0;
+    uint32_t wt_spin = 0, wt_credit = 0, wt_pend = 0, wt_emit = 0;  // probe-9 worker timers
+    (void)wt_spin;
+    (void)wt_credit;
+    (void)wt_pend;
+    (void)wt_emit;
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+    const uint32_t wt_begin = VSA_TICK();
+#endif
 
     // Close the open window: K marker to the writer (it acks lazily, in order), queue for
     // emission. No waiting of any kind here.
@@ -813,11 +908,14 @@ void kernel_main() {
             rq[2] = half;
         }
         kreq_cb.push_back(1);
-        pendq[pend_tail & 1] = {half, window_slots, window_first_listed};
+        pendq[pend_tail % kStages] = {half, window_slots, window_first_listed, 0};
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+        pendq[pend_tail % kStages].t_close = VSA_TICK();
+#endif
         ++pend_tail;
         window_slots = 0;
         window_first_listed = 0xFFFFFFFFu;
-        half ^= 1;
+        half = (half + 1 == kStages) ? 0 : half + 1;
     };
 
     // Emit the oldest pending window if its V pulls landed and its kack arrived. Returns true
@@ -826,10 +924,20 @@ void kernel_main() {
         if (pend_head == pend_tail) {
             return false;
         }
-        const PendingWin& w = pendq[pend_head & 1];
-        if (!half_landed(w.half) || !cb_pages_available_at_front(cb_kack, 1)) {
+        const PendingWin& w = pendq[pend_head % kStages];
+        if (!half_landed(w.half)) {
+            ++wn_fail_v;
             return false;
         }
+        if (!cb_pages_available_at_front(cb_kack, 1)) {
+            ++wn_fail_k;
+            return false;
+        }
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+        wt_lat += VSA_TICK() - w.t_close;
+        ++wn_win;
+#endif
+        VSA_T0(e0);
         kack_cb.wait_front(1);
         kack_cb.pop_front(1);
         for (uint32_t r = 0; r < cur_pass_rows; ++r) {
@@ -871,13 +979,14 @@ void kernel_main() {
         ++pend_head;
         // The safe-post bound moves to the next un-landed window's first listed arrival.
         if (pend_head != pend_tail) {
-            post_limit = pendq[pend_head & 1].first_listed;
+            post_limit = pendq[pend_head % kStages].first_listed;
         } else if (window_first_listed != 0xFFFFFFFFu) {
             post_limit = window_first_listed;
         } else {
             post_limit = 0xFFFFFFFFu;
         }
         post_progress_now();
+        VSA_ACC(wt_emit, e0);
         return true;
     };
 
@@ -921,7 +1030,7 @@ void kernel_main() {
         }
         row_parity_bits = 0;
         row_seen_bits = 0;
-        for (uint32_t h = 0; h < 2; ++h) {
+        for (uint32_t h = 0; h < kStages; ++h) {
             for (uint32_t r = 0; r < pass_rows; ++r) {
                 n_pending[h][r] = 0;
             }
@@ -938,6 +1047,7 @@ void kernel_main() {
             try_emit();
             const uint32_t entry_off = (log_n % log_depth) * log_entry_words;
             invalidate_l1_cache();
+            VSA_T0(s0);
             if (log_ptr[entry_off + 2] != log_n + 1) {
                 do {
                     if (log_n == 0) {
@@ -948,6 +1058,7 @@ void kernel_main() {
                     invalidate_l1_cache();
                 } while (log_ptr[entry_off + 2] != log_n + 1);
             }
+            VSA_ACC(wt_spin, s0);
             const uint32_t b = log_ptr[entry_off + 0];
             const uint32_t leader_slot = log_ptr[entry_off + 1];
             ++log_n;
@@ -970,7 +1081,7 @@ void kernel_main() {
             }
             if (n_listing == 0) {
                 ++consumed;
-                if (consumed % half_slots == 0) {
+                if (consumed % kBinArrivals == 0) {
                     close_window();  // arrival-bin boundary (deterministic partition)
                 }
                 if (consumed - posted >= 4) {
@@ -988,10 +1099,13 @@ void kernel_main() {
                 // A still-pending window on this half owns its slots AND its pending visit
                 // lists: it must emit before the half refills, even when the half has never
                 // been emitted before (half_outstanding == 0 -- guard on the QUEUE, not credits).
-                while (pend_head != pend_tail && pendq[pend_head & 1].half == half) {
+                VSA_T0(p0);
+                while (pend_head != pend_tail && pendq[pend_head % kStages].half == half) {
                     try_emit();
                     post_progress_now();
                 }
+                VSA_ACC(wt_pend, p0);
+                VSA_T0(c0);
                 if (half_outstanding[half] > 0) {
                     while (!cb_pages_available_at_front(cb_free, half_outstanding[half])) {
                         try_emit();
@@ -1001,6 +1115,7 @@ void kernel_main() {
                     free_cb.pop_front(half_outstanding[half]);
                     half_outstanding[half] = 0;
                 }
+                VSA_ACC(wt_credit, c0);
             }
             const uint32_t slot = half * half_slots + window_slots;
 
@@ -1042,7 +1157,7 @@ void kernel_main() {
                 pending[half][listing[i]][n_pending[half][listing[i]]++] = entry;
             }
             ++window_slots;
-            if (consumed % half_slots == 0) {
+            if (consumed % kBinArrivals == 0) {
                 close_window();  // arrival-bin boundary (deterministic partition)
             }
         }
@@ -1070,6 +1185,20 @@ void kernel_main() {
 
     // Flush the tail progress posts (and any stray atomics) before this program ends; in-flight
     // writes would otherwise land on the next program's memory (watcher-detected race otherwise).
+#if defined(VSA_PROBE) && VSA_PROBE == 9
+    DPRINT(
+        "VSAW total={} spin={} credit={} pend={} emit={} consumed={} windows={} close2emit={} failv={} failk={}\n",
+        VSA_TICK() - wt_begin,
+        wt_spin,
+        wt_credit,
+        wt_pend,
+        wt_emit,
+        consumed,
+        wn_win,
+        wt_lat,
+        wn_fail_v,
+        wn_fail_k);
+#endif
     noc.async_write_barrier();
     noc_async_atomic_barrier(noc.get_noc_id());
 #endif  // VSA_IS_LEADER

@@ -12,15 +12,17 @@ are deterministic, and the 15 s / 768p generation runs 1.69x faster end to end.
 |---|---|---|
 | end-to-end t2va, 50 steps, warm, real weights | 325.9 s | 193.2 s (1.69x) |
 | of which denoise (49 steps) | 294.4 s (6.01 s/step) | 160.7 s (3.28 s/step) |
-| one transformer block period, isolated (Tracy device wall) | 78.4 ms | 64.3 ms |
-| attention op inside the block | 51.4 ms (ring SDPA) | 21.5 ms (`vsa_sdpa`) |
+| one transformer block period, isolated (Tracy device wall) | 78.4 ms | 59.8 ms (64.3 at the 09-09 checkpoint) |
+| attention op inside the block | 51.4 ms (ring SDPA) | 17.5 ms (`vsa_sdpa`; 21.5 at the checkpoint) |
 | attention oracle vs the reference implementation (4 gate/placement configs) | | PCC 99.51-99.58 % |
 | `vsa_sdpa` vs fp32 reference, 1024-block rows | | PCC 0.99969, every row at the bf16 floor |
 | repeated launches / trace replay | bit-exact | bit-exact |
 
 The isolated block gap (15 %) understates the end-to-end gap (1.8x on the denoise) because the dense
 block power-throttles under sustained load (median AICLK 975 MHz vs 1268 MHz for VSA); details in
-`VSA_STREAM_DESIGN.md` section 8. Always compare dense vs VSA end to end.
+`VSA_STREAM_DESIGN.md` section 8. Always compare dense vs VSA end to end. The kernel lever pass of
+2026-09-09 (section 10, running log in `VSA_LEVERS_LOG.md`) took `vsa_sdpa` from 23.0 to 19.6 ms on the
+real device-5 shard standalone; the end-to-end number above predates it.
 
 ## Turning it on
 

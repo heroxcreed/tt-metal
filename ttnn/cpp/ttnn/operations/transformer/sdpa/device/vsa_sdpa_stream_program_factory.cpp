@@ -34,10 +34,14 @@ using RtArgs = std::vector<std::variant<uint32_t, tt::tt_metal::Buffer*>>;
 
 constexpr uint32_t kRMax = 10;         // resident rows per pass (<= 32 for the bitmasks); see kStreamDepth
 constexpr uint32_t kRowGroup = 8;      // rows fused per compute phase group
-constexpr uint32_t kStreamDepth =
-    16;  // 18 -> 16 funds the fp32 running-sum buffer (+80 KB) in the model's L1;  // KV blocks in flight (two window
-         // halves of 9). Rows-for-depth trade measured on REAL selections (2.4 blocks/visit): 15/12 -> 10/18 is -4%
-         // standalone, -2% median in the 15 s block; 10/20 is -6% but overflows the model's live L1 by 54 KB
+constexpr uint32_t kStreamDepth = 18;  // KV blocks in flight (kStages window stages of depth/kStages). Measured
+                                       // on the real 15 s shard with the cheap lazy-max decision (2026-09-09):
+                                       // 2 stages x 10 = 19.1 ms, 2 x 9 = see design doc 10, 2 x 8 = 19.7,
+                                       // 3 x 6 = 20.1, 3 x 7 = 20.3. Depth 20 clashes with the model's live
+                                       // L1 buffers by 25 KB in the traced 15 s block (TT_VSA_DEPTH=20 standalone).
+constexpr uint32_t kStages = 2;        // ring stages per worker: windows in flight. A third stage was built to
+                                       // overlap delivery with compute but the wider windows of two stages win
+                                       // (TT_VSA_STAGES=3 keeps it available; see VSA_STREAM_DESIGN.md 10).
 constexpr uint32_t kLogDepth = 16;     // leader arrival-log ring (> leader depth + sentinel slack)
 constexpr uint32_t kMaxWorkers = 16;   // leader runtime-arg array bound
 constexpr uint32_t kRowChunk = 4;      // contiguous rows per placement chunk (matches the kernels)
@@ -230,15 +234,23 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
     if (const char* e = std::getenv("TT_VSA_RMAX"); e != nullptr && e[0] != '\0') {
         rmax = static_cast<uint32_t>(std::atoi(e));
     }
+    uint32_t stages = attrs.distributed ? 2u : kStages;
+    if (const char* e = std::getenv("TT_VSA_STAGES"); !attrs.distributed && e != nullptr && e[0] != '\0') {
+        stages = static_cast<uint32_t>(std::atoi(e));
+    }
+    if (!attrs.distributed && stages != 2) {
+        stream_depth = 6 * stages;  // 6 blocks per stage (18 at 3 stages)
+    }
     if (const char* e = std::getenv("TT_VSA_DEPTH"); e != nullptr && e[0] != '\0') {
         stream_depth = static_cast<uint32_t>(std::atoi(e));
     }
-    TT_FATAL(rmax >= 1 && rmax <= 16 && stream_depth >= 8 && stream_depth % 2 == 0, "bad rmax/depth");
+    TT_FATAL(stages >= 2 && stages <= 3, "vsa_sdpa: TT_VSA_STAGES must be 2 or 3 (4-wide NoC trid groups)");
+    TT_FATAL(rmax >= 1 && rmax <= 16 && stream_depth >= 8 && stream_depth % stages == 0, "bad rmax/depth/stages");
     const uint32_t log_depth = stream_depth + 8;  // arrival-log ring must exceed the slot ring + sentinel slack
     const bool dist = attrs.distributed;
-    // widest visit (blocks) = qk region width; the streaming kernel's windows are half the ring, the
+    // widest visit (blocks) = qk region width; the streaming kernel's windows are one ring stage, the
     // distributed kernel's visits are capped at 6 regardless of ring depth
-    const uint32_t chunk_slots = dist ? 6u : stream_depth / 2;
+    const uint32_t chunk_slots = dist ? 6u : stream_depth / stages;
     const uint32_t bitmap_bytes = ((rmax * ((n_kv_blocks + 31) / 32) * 4 + 15) / 16) * 16;
     // A VISIT message carries up to half_slots entries; the page must hold whichever is larger.
     const uint32_t ctrl_words = 4 + ((rmax > chunk_slots) ? rmax : chunk_slots);
@@ -308,7 +320,10 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
     cb(tile_bytes, stream_depth, bf);                          // cb_vmask (slot-indexed RAM)
     // distributed: messages carry up to 16 visits and credits (n_pulled + 1 per message) can queue
     // ahead of the reader's reclaim, so both rings are deepened (16 B pages: a few hundred bytes)
-    cb(ctrl_page_bytes, dist ? 32 : 8, bf);                    // cb_ctrl
+    // cb_ctrl: a window emits one VISIT per resident row plus a WINDOW message (up to rmax + 1 pages);
+    // the reader blocks in reserve_back until the compute pops, so 8 pages made it stall on every
+    // window while the compute was busy (no arrivals consumed, no progress posted -> leader gate).
+    cb(ctrl_page_bytes, dist ? 32 : 64, bf);                   // cb_ctrl
     cb(16, dist ? 32 : stream_depth, bf);                      // cb_kreq
     cb(16, dist ? 32 : stream_depth, bf);                      // cb_kack
     cb(16, dist ? 128 : stream_depth + 2, bf);                 // cb_free
@@ -430,6 +445,7 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
         probe_defines["VSA_NO_SUMS"] = "1";  // timing-only: no exact row-sum traffic (garbage output)
     }
     probe_defines["VSA_ROW_CHUNK_LOG2"] = std::to_string(std::bit_width(kRowChunk) - 1);
+    probe_defines["VSA_STAGES"] = std::to_string(stages);
 
     if (dist) {
         const char* sl = std::getenv("TT_VSA_SLICE");  // owned blocks per peer per window
@@ -541,8 +557,15 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
     // index sets, feeding the engine's multi-row batching) by static cost, longest chunk first onto the
     // least-loaded consumer -- the leader's slot gate runs the group at its slowest core's pace, so an
     // exempt (dense) row must not stack onto a core that already holds one. Keyed by consumer count.
+    // Leader share (percent of a worker's row chunks the computing leader takes; 100 = equal). The
+    // leader's RISC also streams for the group, so an equal row share makes its compute the group's
+    // laggard (probe 9: leader gated 28-31% on its own credits). Consumer n_consumers-1 is the leader.
+    uint32_t leader_share = 100;
+    if (const char* e = std::getenv("TT_VSA_LEADER_SHARE"); e != nullptr && e[0] != '\0') {
+        leader_share = static_cast<uint32_t>(std::atoi(e));
+    }
     std::map<uint32_t, Dealt> stream_deal;  // n_consumers -> bins[pass][consumer]
-    const auto stream_deal_for = [&](uint32_t n_consumers) -> const Dealt& {
+    const auto stream_deal_for = [&](uint32_t n_consumers, bool leader_last) -> const Dealt& {
         auto it = stream_deal.find(n_consumers);
         if (it != stream_deal.end()) {
             return it->second;
@@ -564,12 +587,24 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
         const uint32_t n_sparse = n_q_tiles - static_cast<uint32_t>(std::count(dense.begin(), dense.end(), true));
         std::vector<std::vector<uint32_t>> per_consumer(n_consumers);
         {
-            uint32_t chunk = 0, in_chunk = 0;
+            uint32_t chunk = 0, in_chunk = 0, lead_acc = 0, redirect = 0;
+            uint32_t target = 0;
             for (uint32_t r = 0; r < n_q_tiles; ++r) {
                 if (dense[r]) {
                     continue;
                 }
-                per_consumer[chunk % n_consumers].push_back(r);
+                if (in_chunk == 0) {
+                    target = chunk % n_consumers;
+                    if (leader_last && n_consumers > 1 && target == n_consumers - 1 && leader_share < 100) {
+                        lead_acc += leader_share;  // the leader takes leader_share% of its turns
+                        if (lead_acc >= 100) {
+                            lead_acc -= 100;
+                        } else {
+                            target = redirect++ % (n_consumers - 1);
+                        }
+                    }
+                }
+                per_consumer[target].push_back(r);
                 if (++in_chunk == kRowChunk) {
                     in_chunk = 0;
                     ++chunk;
@@ -617,6 +652,7 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
         }
         return stream_deal.emplace(n_consumers, std::move(d)).first->second;
     };
+    (void)leader_share;
 
     for (uint32_t i = 0; i < num_cores; ++i) {
         tt::tt_metal::CoreCoord core = {i % grid.x, i / grid.x};
@@ -704,9 +740,12 @@ tt::tt_metal::ProgramDescriptor VsaSdpaOperation::VsaSdpaStreamProgramFactory::c
         // Consumer 0 always holds the most rows under chunk-cyclic dealing. Small shapes are
         // excluded: with few rows per consumer the leader's extra serial work outweighs its
         // compute contribution (measured on the 5s/10s shards).
-        const bool leader_computes = n_q_tiles >= 20 * (n_active + 1);
+        bool leader_computes = n_q_tiles >= 20 * (n_active + 1);
+        if (const char* e = std::getenv("TT_VSA_LEADER_ROWS"); e != nullptr && e[0] != '\0') {
+            leader_computes = e[0] != '0';  // experiment knob: 0 = pure streaming leader, no resident rows
+        }
         const uint32_t n_consumers = n_active + (leader_computes ? 1u : 0u);
-        const Dealt& dealt = stream_deal_for(n_consumers);
+        const Dealt& dealt = stream_deal_for(n_consumers, leader_computes);
         const uint32_t n_passes = is_idle ? 0 : dealt.n_passes;
         // Chunked round-robin placement: 4-row contiguous chunks dealt cyclically across the
         // group's workers. Adjacent rows share most of their index sets (spatial correlation plus
