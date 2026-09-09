@@ -191,6 +191,8 @@ class TtPrefillRuntime:
                 first_k_dense=model_cfg.NUM_DENSE_LAYERS,
                 first_layer_idx=self.config.first_layer_idx,
                 is_first_rank=self.config.is_first_rank,
+                is_last_rank=self.config.is_last_rank,
+                kv_only_last_layer=self.config.kv_only_last_layer,
                 # Required for a LatentMoE model (Kimi-K3): without it the per-block check cannot know
                 # to look for the latent-projection cache files and would call an incomplete cache
                 # complete. model_cfg is already in hand two lines up.

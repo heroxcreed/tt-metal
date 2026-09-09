@@ -54,6 +54,8 @@ class TtPrefillTransformer(LightweightModule):
         first_k_dense: int = 3,
         first_layer_idx: int = 0,
         is_first_rank: bool = True,
+        is_last_rank: bool = True,
+        kv_only_last_layer: bool = False,
         model_cfg: type | None = None,
         routed_expert_weights_dtype: ttnn.DataType = DEFAULT_ROUTED_EXPERT_WEIGHTS_DTYPE,
     ) -> bool:
@@ -78,6 +80,9 @@ class TtPrefillTransformer(LightweightModule):
                 dtype reports complete and the empty placeholder is loaded as the weights.
             is_first_rank: a pipeline-parallel rank builds the embedding only on the
                 first rank, so check it only there. True for single-rank.
+            is_last_rank / kv_only_last_layer: the rank's position and last-layer mode, passed by
+                the runtime alongside the model's own construction arguments. There is no final
+                norm / LM-head cache to gate on them any more, so they do not change what is checked.
             model_cfg: Variant static-constants class, forwarded to the per-block check. Optional
                 so existing callers are unaffected, but MUST be passed for a LatentMoE model
                 (Kimi-K3): without it the block check cannot know to look for the
