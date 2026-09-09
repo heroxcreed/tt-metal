@@ -35,6 +35,9 @@ ENABLE_LOGGING = True
 # Default Test Configuration                                                  #
 PRINT_DETAILED_COMPARISON_FLAG = False
 
+# Module-scoped device: opens once per file instead of once per test case.
+pytestmark = pytest.mark.use_module_device({"l1_small_size": 10 * 1024})
+
 
 # Helper functions for testing
 def create_sample_camera_matrices(num_cams):
@@ -102,7 +105,6 @@ def create_sample_camera_matrices(num_cams):
         ("carla_base", 200, 200, 1, 1.0, 0.0, 0, 0.0),  # CARLA base model
     ],
 )
-@pytest.mark.parametrize("device_params", [{"l1_small_size": 10 * 1024}], indirect=True)
 @pytest.mark.parametrize("seed", [42])
 def test_generate_reference_points(
     device,
@@ -193,7 +195,6 @@ def test_generate_reference_points(
         ("carla_base", 200, 200, 1, 0.999, 5.21, 0.02, 0.5),  # CARLA base model
     ],
 )
-@pytest.mark.parametrize("device_params", [{"l1_small_size": 10 * 1024}], indirect=True)
 @pytest.mark.parametrize("seed", [42])
 def test_point_sampling_3d_to_2d(
     device,

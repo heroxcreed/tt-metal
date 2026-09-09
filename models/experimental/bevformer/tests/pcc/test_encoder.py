@@ -42,6 +42,9 @@ DEFAULT_MODEL_CONFIG = DEFAULT_TEST_CONFIG.model_config
 # Flag to control detailed comparison output
 PRINT_DETAILED_COMPARISON_FLAG = False
 
+# Module-scoped device: opens once per file instead of once per test case.
+pytestmark = pytest.mark.use_module_device({"l1_small_size": 32 * 1024})
+
 
 def create_sample_img_metas(
     batch_size: int, num_cams: int = DEFAULT_DATASET_CONFIG.num_cams, image_shape: tuple = (900, 1600)
@@ -79,7 +82,6 @@ def create_sample_img_metas(
         ("nuscenes_base_fast", (100, 100), 6, 1, 0.996, 0.05, 0.8, 0.5),  # CARLA base fast model
     ],
 )
-@pytest.mark.parametrize("device_params", [{"l1_small_size": 32 * 1024}], indirect=True)
 @pytest.mark.parametrize("seed", [0])
 def test_bevformer_encoder_forward(
     device,
