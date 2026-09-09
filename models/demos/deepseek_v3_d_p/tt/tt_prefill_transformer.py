@@ -8,9 +8,8 @@ TtPrefillTransformer — multi-layer prefill model for DeepSeek V3.
 Composes: embed -> [block x N]. The populated KV cache is the output: production prefill hands the
 KV cache to decode, which owns the LM head, so there is no norm / LM-head / sampling tail here.
 
-Equivalent to the decoder stack of the reference Transformer class
-(models/demos/deepseek_v3/reference/deepseek/model.py:419) but targeting the TT prefill path with
-SP+TP parallelism.
+Equivalent to the reference Transformer class (models/demos/deepseek_v3/reference/deepseek/model.py:419)
+but targeting the TT prefill path with SP+TP parallelism.
 """
 
 from pathlib import Path
@@ -39,7 +38,7 @@ class TtPrefillTransformer(LightweightModule):
     Multi-layer prefill transformer for DeepSeek V3.
 
     Architecture: embed -> [TtPrefillBlock x num_layers]. No norm / LM-head / sampling tail: the
-    populated KV cache is the output (decode owns the LM head).
+    populated KV cache is the output (decode owns that processing).
 
     State dict keys:
         embed_weight:   torch.Tensor [vocab_size, emb_dim]
@@ -336,7 +335,7 @@ class TtPrefillTransformer(LightweightModule):
 
         Pipeline-parallel ranks run a slice of this: the embedding runs only on the
         first rank and only the last rank ends the forward (there is no norm / LM-head /
-        sampling tail: decode owns the LM head), so the input and output are dual-mode
+        sampling tail: decode owns the processing), so the input and output are dual-mode
         (see Args/Returns).
 
         Args:
@@ -472,7 +471,7 @@ class TtPrefillTransformer(LightweightModule):
             return h
 
         # Last (or single) rank: the populated KV cache is the output. There is no norm / LM-head /
-        # sampling tail (decode owns the LM head), so the final hidden state is dropped here and only
+        # sampling tail (decode owns the processing), so the final hidden state is dropped here and only
         # the optional host snapshots are returned.
         if return_intermediates and self.is_balanced:
             # Balanced (zigzag) SP shards the sequence in a permuted chunk order; restore the natural
