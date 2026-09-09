@@ -107,7 +107,7 @@ python3 "${TTRUN_PY}" \
     export PYTHONPATH='${TT_METAL_HOME}'; \
     export PYTHONUNBUFFERED=1; \
     export PREFILL_MANIFEST='${MANIFEST}'; \
-    export PREFILL_FABRIC_MODE=2d; \
+    export PREFILL_FABRIC_MODE=2d_torus_xy; \
     export PREFILL_MAX_SEQ_LEN=${MAX_SEQ_LEN}; \
     export PREFILL_TP_SHARD_KV=${PREFILL_TP_SHARD_KV:-${TP_SHARD_KV_DEFAULT}}; \
     export PREFILL_SYNC_PER_CHUNK=1; \
