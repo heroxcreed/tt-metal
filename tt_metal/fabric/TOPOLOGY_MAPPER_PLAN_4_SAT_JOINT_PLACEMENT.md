@@ -7,9 +7,12 @@ against the full fabric, then choose one seat per mesh with a single SAT solve o
 (`PhysicalGroupingDescriptor::solve_adjacency_guided_placement`) is the current path and stays the
 fallback throughout; every phase below is gated behind a flag and validated against it.
 
-**Priority: 1 if Plan 3 cannot place Gemma; 3 otherwise.** §1 is the evidence.
+**Priority: 3.** Try [Plan 5](TOPOLOGY_MAPPER_PLAN_5_DFS_SEARCH_IMPROVEMENTS.md) first — it attacks the
+same §1 evidence with static heuristics that need none of this machinery, and may place Gemma on its own.
+This plan is what makes the *exact* versions of those heuristics affordable.
 
-Sibling plans: [Plan 3 — connectivity-aware PGD placement](TOPOLOGY_MAPPER_PLAN_3_CONNECTIVITY_AWARE_PGD_PLACEMENT.md).
+Sibling plans: [Plan 3 — connectivity-aware PGD placement](TOPOLOGY_MAPPER_PLAN_3_CONNECTIVITY_AWARE_PGD_PLACEMENT.md),
+[Plan 5 — DFS search improvements](TOPOLOGY_MAPPER_PLAN_5_DFS_SEARCH_IMPROVEMENTS.md).
 
 > **Goal.** Split placement into a *geometry* layer that answers "where can this mesh sit, ignoring
 > everyone else" and a *combinatorial* layer that answers "which seats can all be taken at once".

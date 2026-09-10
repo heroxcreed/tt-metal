@@ -2222,19 +2222,79 @@ void add_relaxed_preferred_chip_constraints(
     }
 }
 
+// How few ways a mesh can be seated, as a static stand-in for its domain size. Fail-first ordering wants
+// the mesh with the fewest live candidates, but counting those is one CSP enumeration per unplaced mesh
+// per search node — more expensive than the enumeration that already dominates the search. Both numbers
+// here come from the grouping list alone, so the whole map is computed once before the search starts.
+struct MeshRigidity {
+    std::size_t footprint_asics = 0;  ///< Largest variant's node count; big shapes have fewer seatings
+    std::size_t variant_count = 0;    ///< Accepted grouping variants; fewer variants, fewer seatings
+};
+
+std::map<GlobalMeshId, MeshRigidity> compute_mesh_rigidity(
+    const std::map<GlobalMeshId, std::vector<GroupingInfo>>& global_mesh_groupings) {
+    std::map<GlobalMeshId, MeshRigidity> rigidity;
+    for (const auto& [mesh_id, variants] : global_mesh_groupings) {
+        MeshRigidity entry;
+        entry.variant_count = variants.size();
+        for (const GroupingInfo& variant : variants) {
+            // Node count rather than asic_count: the nodes are what next_step_pool actually solves over,
+            // so this cannot disagree with the shape that gets placed.
+            entry.footprint_asics = std::max(entry.footprint_asics, variant.adjacency_graph.get_nodes().size());
+        }
+        rigidity.emplace(mesh_id, entry);
+    }
+    return rigidity;
+}
+
 // Which mesh to place next, or nullopt once every mesh is placed (the search's base case). A pure
-// function of the current state: among the unplaced meshes prefer the one with the most already-placed
-// neighbours, so the search keeps growing the frontier it is most constrained by.
+// function of the current state.
+//
+// Frontier membership dominates the ranking, which is what keeps Plan 3's central property: a mesh is
+// seated next to something already placed, so its seams are checked as it is committed rather than
+// discovered to be unreachable several levels later.
+//
+// Rigidity ranks the frontier. Preferring the most-placed-neighbours mesh alone threads the flexible
+// shapes through the fabric first and leaves the rigid ones nothing but shape-mismatched fragments; on
+// the 70-mesh Gemma descriptor that meant 850 search nodes without a single 4x4 ever being attempted.
+// Taking the most rigid reachable mesh instead makes the big shapes claim space while the fabric is
+// still intact. Neighbour count stays as the tiebreak, so among equally rigid choices the behaviour is
+// the old one.
 //
 // When no unplaced mesh has a placed neighbour this returns one anyway, which is how a disconnected
 // mesh graph seeds its next component without any component detection — the components are coupled only
 // through ASIC occupancy, and a single search over them lets a later one force an earlier one to move.
+// The same path picks the seed on the very first call, so the search now opens on the most rigid mesh
+// in the graph.
 //
-// TODO: richer frontier heuristic — pinning seeds, smallest domain, largest shape.
+// TODO: seed from MGD pinnings when present, before rigidity.
 std::optional<GlobalMeshId> select_next_mesh(
-    const AssignedMeshes& assignment, const AdjacencyGraph<GlobalMeshId>& mesh_level_graph) {
+    const AssignedMeshes& assignment,
+    const AdjacencyGraph<GlobalMeshId>& mesh_level_graph,
+    const std::map<GlobalMeshId, MeshRigidity>& rigidity) {
+    // Compared lexicographically, larger wins.
+    struct SelectionKey {
+        bool on_frontier = false;
+        std::size_t footprint_asics = 0;
+        std::size_t variant_count = 0;
+        std::size_t placed_neighbor_count = 0;
+
+        bool operator>(const SelectionKey& other) const {
+            if (on_frontier != other.on_frontier) {
+                return on_frontier;
+            }
+            if (footprint_asics != other.footprint_asics) {
+                return footprint_asics > other.footprint_asics;
+            }
+            if (variant_count != other.variant_count) {
+                return variant_count < other.variant_count;  // fewer variants is more constrained
+            }
+            return placed_neighbor_count > other.placed_neighbor_count;
+        }
+    };
+
     std::optional<GlobalMeshId> next_mesh;
-    std::size_t best_placed_neighbor_count = 0;
+    SelectionKey best_key;
     // mesh_level_graph must have a node per mesh, including meshes with no intermesh connections, or an
     // unconnected mesh is never selected and never placed. build_logical_multi_mesh_adjacency_graph seeds
     // every mesh as a node, and both the remap and the merge preserve isolated ones, so this holds.
@@ -2245,10 +2305,19 @@ std::optional<GlobalMeshId> select_next_mesh(
         if (assignment_has_mesh(assignment, mesh_id)) {
             continue;
         }
-        const std::size_t placed_neighbor_count = placed_neighbors_of(mesh_id, assignment, mesh_level_graph).size();
-        if (!next_mesh.has_value() || placed_neighbor_count > best_placed_neighbor_count) {
+        SelectionKey key;
+        key.placed_neighbor_count = placed_neighbors_of(mesh_id, assignment, mesh_level_graph).size();
+        key.on_frontier = key.placed_neighbor_count > 0;
+        // Absent only for a mesh the caller never gave groupings for, which next_step_pool answers with
+        // an empty pool. Left at the zero key so it ranks last instead of derailing the ordering.
+        const auto rigidity_it = rigidity.find(mesh_id);
+        if (rigidity_it != rigidity.end()) {
+            key.footprint_asics = rigidity_it->second.footprint_asics;
+            key.variant_count = rigidity_it->second.variant_count;
+        }
+        if (!next_mesh.has_value() || key > best_key) {
             next_mesh = mesh_id;
-            best_placed_neighbor_count = placed_neighbor_count;
+            best_key = key;
         }
     }
     return next_mesh;
@@ -2436,6 +2505,7 @@ AssignedMeshes place_remaining_meshes(
 
     // Global variables
     const std::map<GlobalMeshId, std::vector<GroupingInfo>>& global_mesh_groupings,
+    const std::map<GlobalMeshId, MeshRigidity>& rigidity,
     const AdjacencyGraph<GlobalMeshId>& mesh_level_graph,
     const AdjacencyGraph<AsicID>& physical_graph,
     const tt::tt_metal::PhysicalSystemDescriptor& physical_system_descriptor,
@@ -2448,7 +2518,7 @@ AssignedMeshes place_remaining_meshes(
     const std::map<GlobalMeshId, std::string>& mesh_id_to_label) {  // PGD_DFS_DEBUG
     // TODO: seed from MGD pinnings when present, and order seed candidates by
     // symmetry class so a symmetric dead end is not rediscovered once per image.
-    const std::optional<GlobalMeshId> next_mesh = select_next_mesh(assignment, mesh_level_graph);
+    const std::optional<GlobalMeshId> next_mesh = select_next_mesh(assignment, mesh_level_graph, rigidity);
     if (!next_mesh.has_value()) {
         // Base case: every mesh is placed. The only way this is empty is a zero-mesh input, which can
         // only happen in the top-level call, so the recursion never mistakes it for a dead end.
@@ -2541,6 +2611,7 @@ AssignedMeshes place_remaining_meshes(
         AssignedMeshes completed = place_remaining_meshes(
             std::move(branch),
             global_mesh_groupings,
+            rigidity,
             mesh_level_graph,
             physical_graph,
             physical_system_descriptor,
@@ -2625,12 +2696,17 @@ AssignedMeshes start_adjacency_guided_dfs(
     AssignedMeshes deepest_partial;  // PGD_DFS_DEBUG
     std::size_t deepest_count = 0;   // PGD_DFS_DEBUG
 
+    // Static domain-size proxy for the variable ordering. Depends only on the grouping lists, so it is
+    // built once here rather than recomputed at every search node.
+    const std::map<GlobalMeshId, MeshRigidity> rigidity = compute_mesh_rigidity(global_mesh_groupings);
+
     // Start from an empty assignment. No seeding is needed: select_next_mesh picks the first mesh when
     // nothing is placed, and picks a fresh one again whenever the frontier runs dry, which is how
     // disconnected components are covered.
     AssignedMeshes assignment = place_remaining_meshes(
         /*assignment=*/{},
         global_mesh_groupings,
+        rigidity,
         mesh_level_graph,
         physical_graph,
         physical_system_descriptor,
