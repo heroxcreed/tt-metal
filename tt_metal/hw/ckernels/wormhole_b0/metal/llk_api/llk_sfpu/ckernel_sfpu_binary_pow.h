@@ -330,16 +330,21 @@ sfpi_inline sfpi::vFloat _sfpu_binary_power_f32_(sfpi::vFloat base, sfpi::vFloat
     // SFPU `== 0` is bit-exact, so matching -0 needs an abs. Recompute it here
     // rather than reusing abs_base: that live range would span the log2/exp2 body
     // and spills this kernel.
+    // Gating on |pow| covers both signed zeros. A zero exponent is written rather than
+    // left to the mainline's 1: the negative-base branch above is entered for a -0 base
+    // too, and there convert<vSMag16> keeps the sign of a -0 exponent on WH but drops it
+    // on BH, so the bit-exact pow_rounded != pow fires there and overwrites y with NaN.
     // Fill 0 for every non-zero exponent, then narrow to the negative ones, which
     // IEEE defines as +inf. v_and tightens the enclosing predicate in place, so it
     // costs one compare where a second flat v_if would also save and restore the
-    // lane mask. Gating on |pow| lets both signed zeros fall through to the mainline.
+    // lane mask.
     // Both fills take their sign from y rather than writing a positive constant, because
     // IEEE keeps the sign of a zero base through an odd integer exponent.
     sfpi::vFloat abs_end = sfpi::abs(base);
     v_if(abs_end == 0.f) {
         sfpi::vFloat abs_pow = sfpi::abs(pow);
-        v_if(abs_pow != 0.f) {
+        v_if(abs_pow == 0.f) { y = sfpi::vConst1; }
+        v_else {
             y = sfpi::copysgn(sfpi::vFloat(0.0f), y);
             v_and(pow < 0.f);
             y = sfpi::copysgn(sfpi::vFloat(std::numeric_limits<float>::infinity()), y);
